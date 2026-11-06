@@ -1,0 +1,81 @@
+name: AWS Production CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-south-1 # Mumbai
+  ECR_SERVER_REPO: sakhi-server
+  ECS_CLUSTER: sakhi-production-cluster
+  ECS_SERVICE: sakhi-backend-service
+  S3_CLIENT_BUCKET: sakhi-client-web-758371668629
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: women-safety-webApp/Server/package-lock.json
+
+      - name: Verify Backend Builds Cleanly
+        run: |
+          cd women-safety-webApp/Server
+          npm ci
+
+      - name: Build Frontend Assets
+        run: |
+          cd women-safety-webApp/Client
+          npm ci
+          npm run build
+
+      - name: Configure AWS Credentials (OIDC or Secret Keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, Tag, and Push Backend Docker Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_SERVER_REPO:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_SERVER_REPO:latest ./women-safety-webApp/Server
+          docker push $ECR_REGISTRY/$ECR_SERVER_REPO:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_SERVER_REPO:latest
+
+      - name: Deploy Backend Container to AWS ECS Fargate
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --force-new-deployment
+
+      - name: Deploy Frontend to S3 and Invalidate CloudFront CDN
+        if: env.S3_CLIENT_BUCKET != ''
+        env:
+          S3_CLIENT_BUCKET: ${{ secrets.S3_CLIENT_BUCKET }}
+          CLOUDFRONT_DIST_ID: ${{ secrets.CLOUDFRONT_DIST_ID }}
+        run: |
+          aws s3 sync ./women-safety-webApp/Client/dist s3://$S3_CLIENT_BUCKET --delete
+          if [ -n "$CLOUDFRONT_DIST_ID" ]; then
+            aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DIST_ID --paths "/*"
+          fi
+

@@ -26,6 +26,26 @@ const io = new Server(server, {
   maxHttpBufferSize: 10 * 1024 * 1024 // 10MB for audio uploads
 });
 
+// Setup Redis Adapter for multi-server WebSocket scaling if REDIS_URL is provided
+if (process.env.REDIS_URL) {
+  const { createAdapter } = require('@socket.io/redis-adapter');
+  const { createClient } = require('redis');
+  const pubClient = createClient({ url: process.env.REDIS_URL });
+  const subClient = pubClient.duplicate();
+
+  pubClient.on('error', (err) => console.error('[Redis Pub Error]', err.message));
+  subClient.on('error', (err) => console.error('[Redis Sub Error]', err.message));
+
+  Promise.all([pubClient.connect(), subClient.connect()])
+    .then(() => {
+      io.adapter(createAdapter(pubClient, subClient));
+      console.log('⚡ Socket.IO Redis Cluster Adapter connected successfully (Multi-node Ready)');
+    })
+    .catch((err) => {
+      console.warn('⚠️ Redis adapter failed to connect, falling back to standalone socket memory:', err.message);
+    });
+}
+
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 

@@ -1,0 +1,35 @@
+# Environment variables and secrets
+.env
+.env*
+!.env.example
+*.pem
+*.key
+*.csv
+
+# Logs & Evidence
+*.log
+npm-debug.log*
+evidence/
+women-safety-webApp/Server/evidence/
+
+# Dependencies
+node_modules/
+women-safety-webApp/Server/node_modules/
+women-safety-webApp/Client/node_modules/
+
+# Production builds
+dist/
+dist-ssr/
+build/
+women-safety-webApp/Client/dist/
+
+# OS and Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
