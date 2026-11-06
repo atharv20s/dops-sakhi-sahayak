@@ -13,7 +13,7 @@ env:
   ECR_SERVER_REPO: sakhi-server
   ECS_CLUSTER: sakhi-production-cluster
   ECS_SERVICE: sakhi-backend-service
-  S3_CLIENT_BUCKET: sakhi-client-web-758371668629
+  S3_CLIENT_BUCKET: ${{ secrets.S3_CLIENT_BUCKET }}
 
 jobs:
   build-and-deploy:
