@@ -32,11 +32,9 @@ Create an **image-backed Web Service** in the Render Dashboard. Do not choose a 
 
 The initial manual setup is required because this project does not yet have a Render service ID or registry credential ID in its source configuration. The workflow will not create paid Render resources.
 
-## GitHub Actions environment configuration
+## GitHub Actions configuration
 
-Use the existing GitHub Actions environment named `production`.
-
-Add these **environment secrets**:
+Add these **repository secrets** under Settings → Secrets and variables → Actions → Secrets:
 
 | Secret | Value |
 |---|---|
@@ -44,11 +42,12 @@ Add these **environment secrets**:
 | `RENDER_SERVICE_ID` | ID of the image-backed Render Web Service |
 | `RENDER_REGISTRY_CREDENTIAL_ID` | ID of the AWS ECR registry credential in Render |
 
-Add this **environment variable**:
+Add these **repository variables** under Settings → Secrets and variables → Actions → Variables:
 
 | Variable | Value |
 |---|---|
 | `RENDER_SERVICE_URL` | Public service origin, e.g. `https://your-service.onrender.com` (no trailing slash) |
+| `RENDER_DEPLOY_ENABLED` | Set to `true` only after the image-backed service, registry credential, and secrets are configured |
 
 Also add this **repository Actions variable** (not a secret):\n\n| Variable | Value |\n|---|---|\n| `RENDER_DEPLOY_ENABLED` | `true` only after the Render image-backed service, registry credential, and GitHub environment secrets are all configured; otherwise leave it unset |\n\nUntil `RENDER_DEPLOY_ENABLED=true`, CI and ECR publishing still run but the Render deploy and credential-refresh jobs are skipped.\n\nDo not commit API keys, deploy hooks, ECR passwords, or application secrets. Do not paste credentials into chat or workflow files.
 
@@ -78,7 +77,7 @@ The immutable digest—not `latest`—is the deployed release identifier.
 
 AWS ECR authorization passwords expire after 12 hours. Render's documentation says a private ECR credential must be refreshed and that services using an updated credential must be redeployed to use the updated values.
 
-The separate `refresh-render-ecr-credential.yml` workflow runs every six hours. It:
+The separate `refresh-render-ecr-credential.yml` workflow runs every six hours without a manual production approval. It:
 1. Finds the most recent live Render image digest.
 2. Gets a fresh ECR password through GitHub OIDC.
 3. Updates the Render registry credential.
