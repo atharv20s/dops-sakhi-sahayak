@@ -7,6 +7,10 @@ const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const bcrypt = require('bcryptjs');
+
+// ── Database Client (Prisma PostgreSQL) ──
+const { prisma, checkDatabaseHealth, isDatabaseConfigured } = require('./db');
 
 const User = require('./models/User');
 const PoliceStation = require('./models/PoliceStation');
@@ -14,7 +18,7 @@ const PoliceStation = require('./models/PoliceStation');
 // ── LangGraph/Voice Agent Modules ──
 const voiceAgent = require('./voiceAgent');
 const { setupWebRTCSignaling } = require('./webrtcSignaling');
-const { saveEvidence, listEvidence, EVIDENCE_DIR } = require('./evidenceRecorder');
+const { saveEvidence, listEvidence, getEvidenceDownloadUrl, EVIDENCE_DIR } = require('./evidenceRecorder');
 const { dispatchFullEmergency, dispatchLiveLocation, EMERGENCY_EMAIL, EMERGENCY_PHONE } = require('./emergencyDispatcher');
 
 const app = express();
@@ -59,8 +63,42 @@ const healthHandler = (req, res) => {
   });
 };
 
-// Direct health endpoint for Docker and infrastructure monitoring.
+// Dependency readiness check — verifies PostgreSQL connectivity
+const readyHandler = async (req, res) => {
+  const dbHealth = await checkDatabaseHealth();
+  if (dbHealth.ok) {
+    return res.status(200).json({
+      status: 'ready',
+      service: 'sakhi-backend',
+      database: 'connected',
+      latencyMs: dbHealth.latencyMs,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // In production, database is strictly required
+  if (process.env.NODE_ENV === 'production' || isDatabaseConfigured()) {
+    return res.status(503).json({
+      status: 'unready',
+      service: 'sakhi-backend',
+      database: 'disconnected',
+      error: dbHealth.error,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  // In local development without DATABASE_URL, indicate unconfigured
+  return res.status(200).json({
+    status: 'ready',
+    service: 'sakhi-backend',
+    database: 'unconfigured (dev mode)',
+    timestamp: new Date().toISOString()
+  });
+};
+
+// Direct health and readiness endpoints for Docker and infrastructure monitoring.
 app.get('/health', healthHandler);
+app.get('/ready', readyHandler);
 
 // Serve evidence files statically
 app.use('/evidence', express.static(EVIDENCE_DIR));
@@ -96,60 +134,224 @@ function haversineDistance(lat1, lng1, lat2, lng2) {
   return R * c;
 }
 
+// ── Nearest Police Station Helper (PostgreSQL with Haversine fallback) ──
+async function findNearestPoliceStation(userLat, userLng) {
+  if (isDatabaseConfigured()) {
+    try {
+      const stations = await prisma.$queryRaw`
+        SELECT id, name, lat, lng, phone, email, zone, officer_in_charge, type, category, address, description,
+          (6371 * acos(
+            cos(radians(${userLat})) * cos(radians(lat)) *
+            cos(radians(lng) - radians(${userLng})) +
+            sin(radians(${userLat})) * sin(radians(lat))
+          )) AS distance_km
+        FROM police_stations
+        WHERE category = 'station'
+          AND lat BETWEEN (${userLat} - 0.5) AND (${userLat} + 0.5)
+          AND lng BETWEEN (${userLng} - 0.5) AND (${userLng} + 0.5)
+        ORDER BY distance_km ASC
+        LIMIT 1
+      `;
+      if (stations && stations.length > 0) {
+        const s = stations[0];
+        const distance = Number(s.distance_km);
+        if (distance <= 50) {
+          const phoneList = Array.isArray(s.phone) ? s.phone : (s.phone ? [s.phone] : []);
+          return {
+            source: 'postgresql',
+            station: {
+              name: s.name,
+              phone: phoneList,
+              email: s.email,
+              zone: s.zone,
+              officerInCharge: s.officer_in_charge,
+              type: s.type,
+              lat: s.lat,
+              lng: s.lng,
+              address: s.address,
+              description: s.description,
+              distance,
+              distanceText: distance > 1 ? `${distance.toFixed(1)} km` : `${(distance * 1000).toFixed(0)} m`
+            }
+          };
+        }
+      }
+    } catch (dbErr) {
+      console.warn('⚠️ PostgreSQL station query error, falling back:', dbErr.message);
+    }
+  }
+
+  // Fallback to safety_data.json
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
+    const stations = data.police_stations || [];
+    let nearest = null;
+    let minDist = Infinity;
+    stations.forEach(st => {
+      const d = haversineDistance(userLat, userLng, st.lat, st.lng);
+      if (d < minDist) {
+        minDist = d;
+        nearest = { ...st, distance: d };
+      }
+    });
+    if (nearest) {
+      return {
+        source: 'json_fallback',
+        station: {
+          name: nearest.name,
+          phone: nearest.contact ? [nearest.contact] : [],
+          email: nearest.email || '',
+          zone: '',
+          officerInCharge: '',
+          type: 'city',
+          lat: nearest.lat,
+          lng: nearest.lng,
+          address: '',
+          description: nearest.description || '',
+          distance: nearest.distance,
+          distanceText: nearest.distance > 1 ? `${nearest.distance.toFixed(1)} km` : `${(nearest.distance * 1000).toFixed(0)} m`
+        }
+      };
+    }
+  } catch (err) {
+    console.error('Station fallback error:', err);
+  }
+  return null;
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  API ROUTES
 // ═══════════════════════════════════════════════════════════════
 const router = express.Router();
 
-// ── Auth: Signup ──
+// ── Auth: Signup (bcryptjs work factor 12, zero plaintext leakage) ──
 router.post('/signup', async (req, res) => {
   try {
-    const { userName, userPhone, userPassword, emergencyName, emergencyPhone } = req.body;
+    const { userName, userPhone, userPassword, emergencyName, emergencyPhone } = req.body || {};
+    if (!userName || !userPhone || !userPassword) {
+      return res.status(400).json({ success: false, msg: 'Name, phone and password are required.' });
+    }
 
-    if (!isMongoConnected) {
-      if (memoryUsers.find(u => u.phone === userPhone)) {
-        return res.status(400).json({ success: false, msg: 'User already exists! Please login.' });
+    if (isDatabaseConfigured()) {
+      const existingUser = await prisma.user.findUnique({ where: { phone: String(userPhone) } });
+      if (existingUser) {
+        return res.status(400).json({ success: false, msg: 'User with this phone number already exists! Please login.' });
       }
-      const newUser = { name: userName, phone: userPhone, password: userPassword, emergencyContact: { name: emergencyName, phone: emergencyPhone } };
-      memoryUsers.push(newUser);
-      return res.status(201).json({ success: true, user: newUser, msg: 'Signup successful (Memory Mode)' });
+
+      const passwordHash = await bcrypt.hash(String(userPassword), 12);
+      const newUser = await prisma.user.create({
+        data: {
+          name: String(userName),
+          phone: String(userPhone),
+          passwordHash,
+          emergencyContactName: emergencyName || null,
+          emergencyContactPhone: emergencyPhone || null
+        }
+      });
+
+      return res.status(201).json({
+        success: true,
+        user: {
+          name: newUser.name,
+          phone: newUser.phone,
+          emergencyContact: {
+            name: newUser.emergencyContactName,
+            phone: newUser.emergencyContactPhone
+          }
+        },
+        msg: 'Signup successful!'
+      });
     }
 
-    let existingUser = await User.findOne({ phone: userPhone });
-    if (existingUser) {
-      return res.status(400).json({ success: false, msg: 'User with this phone number already exists! Please login.' });
+    // In production, do not silently downgrade to memory
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({ success: false, msg: 'Database unavailable. In-memory storage is disabled in production.' });
     }
 
-    const newUser = new User({
+    // Local development fallback with bcrypt
+    if (memoryUsers.find(u => u.phone === userPhone)) {
+      return res.status(400).json({ success: false, msg: 'User already exists! Please login.' });
+    }
+
+    const passwordHash = await bcrypt.hash(String(userPassword), 12);
+    const memUser = {
       name: userName,
       phone: userPhone,
-      password: userPassword,
+      passwordHash,
       emergencyContact: { name: emergencyName, phone: emergencyPhone }
+    };
+    memoryUsers.push(memUser);
+
+    return res.status(201).json({
+      success: true,
+      user: {
+        name: memUser.name,
+        phone: memUser.phone,
+        emergencyContact: memUser.emergencyContact
+      },
+      msg: 'Signup successful (Memory Dev Mode)'
     });
-    await newUser.save();
-    return res.status(201).json({ success: true, user: newUser, msg: 'Signup successful!' });
   } catch (err) {
     console.error('Signup Route Error: ', err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ── Auth: Login ──
+// ── Auth: Login (bcryptjs compare, zero password leakage) ──
 router.post('/login', async (req, res) => {
   try {
-    const { userPhone, userPassword } = req.body;
-
-    if (!isMongoConnected) {
-      const user = memoryUsers.find(u => u.phone === userPhone);
-      if (!user) return res.status(200).json({ success: false, msg: 'User not found! (Memory Mode)' });
-      if (user.password !== userPassword) return res.status(200).json({ success: false, msg: 'Invalid password!' });
-      return res.status(200).json({ success: true, user: user, msg: 'Login successful!' });
+    const { userPhone, userPassword } = req.body || {};
+    if (!userPhone || !userPassword) {
+      return res.status(400).json({ success: false, msg: 'Phone and password are required.' });
     }
 
-    const user = await User.findOne({ phone: userPhone });
-    if (!user) return res.status(200).json({ success: false, msg: 'User not found!' });
-    if (user.password !== userPassword) return res.status(200).json({ success: false, msg: 'Invalid password!' });
-    return res.status(200).json({ success: true, user: user, msg: 'Login successful!' });
+    if (isDatabaseConfigured()) {
+      const user = await prisma.user.findUnique({ where: { phone: String(userPhone) } });
+      if (!user) {
+        return res.status(200).json({ success: false, msg: 'User not found!' });
+      }
+
+      const isMatch = await bcrypt.compare(String(userPassword), user.passwordHash);
+      if (!isMatch) {
+        return res.status(200).json({ success: false, msg: 'Invalid password!' });
+      }
+
+      return res.status(200).json({
+        success: true,
+        user: {
+          name: user.name,
+          phone: user.phone,
+          emergencyContact: {
+            name: user.emergencyContactName,
+            phone: user.emergencyContactPhone
+          }
+        },
+        msg: 'Login successful!'
+      });
+    }
+
+    // In production, do not silently downgrade to memory
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({ success: false, msg: 'Database unavailable. In-memory storage is disabled in production.' });
+    }
+
+    // Local development fallback
+    const memUser = memoryUsers.find(u => u.phone === userPhone);
+    if (!memUser) return res.status(200).json({ success: false, msg: 'User not found! (Memory Mode)' });
+    const match = memUser.passwordHash
+      ? await bcrypt.compare(String(userPassword), memUser.passwordHash)
+      : (memUser.password === userPassword);
+    if (!match) return res.status(200).json({ success: false, msg: 'Invalid password!' });
+
+    return res.status(200).json({
+      success: true,
+      user: {
+        name: memUser.name,
+        phone: memUser.phone,
+        emergencyContact: memUser.emergencyContact
+      },
+      msg: 'Login successful!'
+    });
   } catch (err) {
     console.error('Login Route Error: ', err);
     res.status(500).json({ success: false, error: err.message });
@@ -175,14 +377,29 @@ router.get('/safety-data', (req, res) => {
   }
 });
 
-router.get('/nearest', (req, res) => {
+router.get('/nearest', async (req, res) => {
   try {
     const { lat, lng } = req.query;
     if (!lat || !lng) return res.status(400).json({ error: 'Missing lat/lng' });
 
-    const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
     const userLat = parseFloat(lat);
     const userLng = parseFloat(lng);
+
+    // 1. Police station (PostgreSQL via findNearestPoliceStation)
+    const nearestPoliceResult = await findNearestPoliceStation(userLat, userLng);
+    let policeStationObj = null;
+    if (nearestPoliceResult && nearestPoliceResult.station) {
+      const st = nearestPoliceResult.station;
+      policeStationObj = {
+        name: st.name,
+        distance: st.distance,
+        description: st.description,
+        contact: Array.isArray(st.phone) && st.phone.length > 0 ? st.phone[0] : (st.phone || '')
+      };
+    }
+
+    // 2. Hospital, Metro, Danger Zone from safety_data.json
+    const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
 
     const findNearest = (list) => {
       if (!list || list.length === 0) return null;
@@ -200,7 +417,7 @@ router.get('/nearest', (req, res) => {
     };
 
     res.json({
-      police_station: findNearest(data.police_stations),
+      police_station: policeStationObj || findNearest(data.police_stations),
       hospital: findNearest(data.hospitals),
       metro: findNearest(data.metro_stations),
       danger_zone: findNearest(data.danger_zones)
@@ -219,76 +436,18 @@ router.get('/sos-nearest-station', async (req, res) => {
     const userLat = parseFloat(lat);
     const userLng = parseFloat(lng);
 
-    // Try MongoDB geospatial query first
-    if (isMongoConnected) {
-      try {
-        const nearestStation = await PoliceStation.findOne({
-          location: {
-            $near: {
-              $geometry: { type: 'Point', coordinates: [userLng, userLat] },
-              $maxDistance: 50000
-            }
-          },
-          category: 'station'
-        });
-
-        if (nearestStation) {
-          const distance = haversineDistance(userLat, userLng, nearestStation.lat, nearestStation.lng);
-          return res.json({
-            success: true,
-            source: 'mongodb',
-            station: {
-              name: nearestStation.name,
-              phone: nearestStation.phone,
-              email: nearestStation.email,
-              zone: nearestStation.zone,
-              officerInCharge: nearestStation.officerInCharge,
-              type: nearestStation.type,
-              lat: nearestStation.lat,
-              lng: nearestStation.lng,
-              address: nearestStation.address,
-              description: nearestStation.description,
-              distance,
-              distanceText: distance > 1 ? `${distance.toFixed(1)} km` : `${(distance * 1000).toFixed(0)} m`
-            },
-            userLocation: { lat: userLat, lng: userLng, googleMapsLink: `https://maps.google.com/maps?q=${userLat},${userLng}`, timestamp: new Date().toISOString() }
-          });
-        }
-      } catch (geoErr) {
-        console.log('⚠️ MongoDB geospatial query failed, using JSON fallback:', geoErr.message);
-      }
-    }
-
-    // Fallback: Use safety_data.json
-    const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
-    const stations = data.police_stations || [];
-    let nearest = null;
-    let minDist = Infinity;
-
-    stations.forEach(station => {
-      const d = haversineDistance(userLat, userLng, station.lat, station.lng);
-      if (d < minDist) { minDist = d; nearest = { ...station, distance: d }; }
-    });
-
-    if (nearest) {
+    const result = await findNearestPoliceStation(userLat, userLng);
+    if (result && result.station) {
       return res.json({
         success: true,
-        source: 'json_fallback',
-        station: {
-          name: nearest.name,
-          phone: [nearest.contact].filter(Boolean),
-          email: nearest.email || '',
-          zone: '',
-          officerInCharge: '',
-          type: 'city',
-          lat: nearest.lat,
-          lng: nearest.lng,
-          address: '',
-          description: nearest.description,
-          distance: nearest.distance,
-          distanceText: nearest.distance > 1 ? `${nearest.distance.toFixed(1)} km` : `${(nearest.distance * 1000).toFixed(0)} m`
-        },
-        userLocation: { lat: userLat, lng: userLng, googleMapsLink: `https://maps.google.com/maps?q=${userLat},${userLng}`, timestamp: new Date().toISOString() }
+        source: result.source,
+        station: result.station,
+        userLocation: {
+          lat: userLat,
+          lng: userLng,
+          googleMapsLink: `https://maps.google.com/maps?q=${userLat},${userLng}`,
+          timestamp: new Date().toISOString()
+        }
       });
     }
 
@@ -302,10 +461,25 @@ router.get('/sos-nearest-station', async (req, res) => {
 // ── Get All Police Stations ──
 router.get('/police-stations', async (req, res) => {
   try {
+    if (isDatabaseConfigured()) {
+      try {
+        const stations = await prisma.policeStation.findMany({
+          where: { category: 'station' },
+          orderBy: { name: 'asc' }
+        });
+        if (stations && stations.length > 0) {
+          return res.json({ success: true, count: stations.length, stations });
+        }
+      } catch (dbErr) {
+        console.warn('⚠️ PostgreSQL police stations query error, using fallback:', dbErr.message);
+      }
+    }
+
     if (isMongoConnected) {
       const stations = await PoliceStation.find({ category: 'station' }).select('-__v');
       return res.json({ success: true, count: stations.length, stations });
     }
+
     const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
     res.json({ success: true, count: (data.police_stations || []).length, stations: data.police_stations || [] });
   } catch (err) {
@@ -511,16 +685,50 @@ router.get('/trusted-services', (req, res) => {
   }
 });
 
-router.get('/safety-reports', (req, res) => {
+// ── Evidence Download URL (Authorized Presigned S3 URL) ──
+router.get('/evidence/:trackingId/:fileName/url', async (req, res) => {
   try {
+    const { trackingId, fileName } = req.params;
+    const result = await getEvidenceDownloadUrl(trackingId, fileName);
+    if (!result) {
+      return res.status(404).json({ success: false, error: 'S3 presigned URL not available. Ensure S3_EVIDENCE_BUCKET is configured.' });
+    }
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+router.get('/safety-reports', async (req, res) => {
+  try {
+    if (isDatabaseConfigured()) {
+      try {
+        const dbReports = await prisma.safetyReport.findMany({
+          orderBy: { createdAt: 'desc' }
+        });
+        const reports = dbReports.map(r => ({
+          id: r.id,
+          category: r.category,
+          locality: r.locality,
+          description: r.description,
+          lat: r.shareExact ? r.lat : null,
+          lng: r.shareExact ? r.lng : null,
+          createdAt: r.createdAt
+        }));
+        return res.json({ success: true, count: reports.length, reports });
+      } catch (dbErr) {
+        console.warn('⚠️ PostgreSQL safety reports query error, using fallback:', dbErr.message);
+      }
+    }
+
     const data = readJsonFile(REPORTS_FILE, { reports: [] });
     const reports = (data.reports || []).map(r => ({
       id: r.id,
       category: r.category,
       locality: r.locality,
       description: r.description,
-      lat: r.exact ? r.lat : coarseCoord(r.lat),
-      lng: r.exact ? r.lng : coarseCoord(r.lng),
+      lat: r.exact ? r.lat : null,
+      lng: r.exact ? r.lng : null,
       createdAt: r.createdAt
     }));
     res.json({ success: true, count: reports.length, reports });
@@ -529,7 +737,7 @@ router.get('/safety-reports', (req, res) => {
   }
 });
 
-router.post('/safety-reports', (req, res) => {
+router.post('/safety-reports', async (req, res) => {
   try {
     const { category, locality, description, lat, lng, shareExact } = req.body || {};
     if (!category || !description) {
@@ -540,13 +748,44 @@ router.post('/safety-reports', (req, res) => {
     const parsedLng = lng !== undefined && lng !== '' ? parseFloat(lng) : null;
     const exact = Boolean(shareExact) && parsedLat !== null && parsedLng !== null;
 
+    // Strict privacy consent: When shareExact is false, lat/lng MUST be null
+    const storedLat = exact ? parsedLat : null;
+    const storedLng = exact ? parsedLng : null;
+
+    if (isDatabaseConfigured()) {
+      const report = await prisma.safetyReport.create({
+        data: {
+          category: String(category).slice(0, 50),
+          locality: String(locality || 'Area withheld').slice(0, 150),
+          description: String(description).slice(0, 800),
+          lat: storedLat,
+          lng: storedLng,
+          shareExact: exact
+        }
+      });
+
+      return res.status(201).json({
+        success: true,
+        msg: 'Report saved. No name or phone was stored.',
+        report: {
+          id: report.id,
+          category: report.category,
+          locality: report.locality,
+          description: report.description,
+          lat: report.lat,
+          lng: report.lng,
+          createdAt: report.createdAt
+        }
+      });
+    }
+
     const report = {
       id: `r-${Date.now()}`,
       category: String(category).slice(0, 80),
       locality: String(locality || 'Area withheld').slice(0, 120),
       description: String(description).slice(0, 800),
-      lat: parsedLat,
-      lng: parsedLng,
+      lat: storedLat,
+      lng: storedLng,
       exact,
       createdAt: new Date().toISOString()
     };
@@ -564,8 +803,8 @@ router.post('/safety-reports', (req, res) => {
         category: report.category,
         locality: report.locality,
         description: report.description,
-        lat: exact ? report.lat : (report.lat === null ? null : coarseCoord(report.lat)),
-        lng: exact ? report.lng : (report.lng === null ? null : coarseCoord(report.lng)),
+        lat: report.lat,
+        lng: report.lng,
         createdAt: report.createdAt
       }
     });
@@ -574,8 +813,9 @@ router.post('/safety-reports', (req, res) => {
   }
 });
 
-// API-level health endpoint.
+// API-level health and readiness endpoints.
 router.get('/health', healthHandler);
+router.get('/ready', readyHandler);
 
 app.use('/api', router);
 

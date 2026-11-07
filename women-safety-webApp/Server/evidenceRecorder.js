@@ -1,28 +1,33 @@
 // ============================================================================
-//  EVIDENCE RECORDER — Hybrid Local & AWS S3 Storage with SHA-256 Integrity
+//  EVIDENCE RECORDER — S3 Object Storage + PostgreSQL Metadata + Presigned URLs
 // ============================================================================
 
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const EVIDENCE_DIR = path.join(__dirname, 'evidence');
 const MAX_RECORDING_MS = 8 * 60 * 1000; // 8 minutes
 
-// AWS S3 Client setup if configured in environment
-const AWS_REGION = process.env.AWS_REGION || 'ap-south-1';
-const S3_BUCKET_NAME = process.env.S3_EVIDENCE_BUCKET;
-
-let s3Client = null;
-if (S3_BUCKET_NAME) {
-  s3Client = new S3Client({ region: AWS_REGION });
-  console.log(`[EvidenceRecorder] ☁️ AWS S3 Uploads Enabled (Bucket: ${S3_BUCKET_NAME})`);
-} else {
-  console.log('[EvidenceRecorder] 📁 AWS S3 not configured. Operating in local storage mode.');
+// Lazy DB loader to avoid re-populating process.env during unit tests
+function getDb() {
+  try {
+    return require('./db');
+  } catch {
+    return null;
+  }
 }
 
-// Ensure local evidence directory exists
+function getS3Client() {
+  const bucket = process.env.S3_EVIDENCE_BUCKET;
+  if (!bucket) return null;
+  const region = process.env.AWS_REGION || 'ap-south-1';
+  return new S3Client({ region });
+}
+
+// Ensure local evidence directory exists (for local mode / temp storage)
 function ensureDir() {
   if (!fs.existsSync(EVIDENCE_DIR)) {
     fs.mkdirSync(EVIDENCE_DIR, { recursive: true });
@@ -34,28 +39,31 @@ function ensureDir() {
  * Throws on failure so callers cannot silently report success.
  */
 async function uploadToS3(key, body, contentType) {
-  if (!s3Client || !S3_BUCKET_NAME) return null;
+  const bucket = process.env.S3_EVIDENCE_BUCKET;
+  const client = getS3Client();
+  if (!client || !bucket) return null;
 
   const command = new PutObjectCommand({
-    Bucket: S3_BUCKET_NAME,
+    Bucket: bucket,
     Key: key,
     Body: body,
     ContentType: contentType,
     ServerSideEncryption: 'AES256'
   });
 
-  await s3Client.send(command);
+  await client.send(command);
 
-  const s3Url = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+  const region = process.env.AWS_REGION || 'ap-south-1';
+  const s3Url = `https://${bucket}.s3.${region}.amazonaws.com/${key}`;
   console.log(`[EvidenceRecorder] ☁️ Uploaded to S3: ${key}`);
   return s3Url;
 }
 
 /**
- * Save evidence locally and upload audio + metadata to S3.
- * Success in S3 mode means BOTH objects were uploaded.
+ * Save evidence to S3 and record metadata in PostgreSQL.
+ * Maintains local file write for test environments or when offline.
  */
-async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
+async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = null) {
   if (
     typeof trackingId !== 'string' ||
     !/^[a-zA-Z0-9_-]{1,100}$/.test(trackingId)
@@ -69,7 +77,7 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
   const fileName = `evidence_${trackingId}_${timestamp}.${format}`;
   const filePath = path.join(EVIDENCE_DIR, fileName);
 
-  // Save local copy
+  // Save local copy (for backward compatibility / offline tests)
   fs.writeFileSync(filePath, audioBuffer);
 
   // Calculate SHA-256
@@ -78,10 +86,13 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
     .update(audioBuffer)
     .digest('hex');
 
+  const s3Bucket = process.env.S3_EVIDENCE_BUCKET;
+  const s3Client = getS3Client();
   let s3Url = null;
+  let s3AudioKey = null;
 
-  if (s3Client && S3_BUCKET_NAME) {
-    const s3AudioKey = `evidence/${trackingId}/${fileName}`;
+  if (s3Client && s3Bucket) {
+    s3AudioKey = `evidence/${trackingId}/${fileName}`;
 
     // Upload audio first. Failure propagates.
     s3Url = await uploadToS3(
@@ -102,16 +113,11 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
     };
 
     const metadataPath = `${filePath}.json`;
-
-    fs.writeFileSync(
-      metadataPath,
-      JSON.stringify(metadata, null, 2)
-    );
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
 
     const s3MetaKey = `${s3AudioKey}.json`;
 
     try {
-      // Metadata must also upload successfully.
       await uploadToS3(
         s3MetaKey,
         JSON.stringify(metadata, null, 2),
@@ -119,9 +125,33 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
       );
     } catch (error) {
       console.error(
-        `[EvidenceRecorder] Metadata upload failed. Audio object may remain in S3: ${s3AudioKey}`
+        `[EvidenceRecorder] Metadata upload failed: ${s3MetaKey}`
       );
       throw error;
+    }
+
+    // Persist to PostgreSQL if configured
+    const db = getDb();
+    if (db && db.isDatabaseConfigured()) {
+      try {
+        await db.prisma.evidenceObject.create({
+          data: {
+            trackingId,
+            s3Key: s3AudioKey,
+            s3Bucket: s3Bucket,
+            fileName,
+            fileFormat: format,
+            sha256: hash,
+            sizeBytes: audioBuffer.length,
+            mimeType: `audio/${format}`,
+            userId: userId || null,
+            metadata
+          }
+        });
+        console.log(`[EvidenceRecorder] 🗄️ Metadata persisted to PostgreSQL for tracking: ${trackingId}`);
+      } catch (dbErr) {
+        console.warn(`[EvidenceRecorder] PostgreSQL metadata persistence warning:`, dbErr.message);
+      }
     }
 
     console.log(
@@ -151,11 +181,7 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
   };
 
   const metadataPath = `${filePath}.json`;
-
-  fs.writeFileSync(
-    metadataPath,
-    JSON.stringify(metadata, null, 2)
-  );
+  fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
 
   console.log(
     `[EvidenceRecorder] ✅ Evidence saved locally: ${fileName}`
@@ -189,21 +215,65 @@ async function createMetadata(trackingId, data) {
   const content = JSON.stringify(record, null, 2);
   fs.writeFileSync(filePath, content);
 
-  await uploadToS3(`evidence/${trackingId}/${fileName}`, content, 'application/json');
+  if (process.env.S3_EVIDENCE_BUCKET) {
+    await uploadToS3(`evidence/${trackingId}/${fileName}`, content, 'application/json');
+  }
   return filePath;
 }
 
 /**
- * List all evidence files for a tracking ID
+ * List all evidence for a tracking ID.
+ * Reads from PostgreSQL metadata when available, with local disk fallback.
  */
-function listEvidence(trackingId) {
+async function listEvidence(trackingId) {
+  const db = getDb();
+  if (db && db.isDatabaseConfigured()) {
+    try {
+      const records = await db.prisma.evidenceObject.findMany({
+        where: { trackingId },
+        orderBy: { createdAt: 'desc' }
+      });
+      if (records && records.length > 0) {
+        return records;
+      }
+    } catch (dbErr) {
+      console.warn('[EvidenceRecorder] PostgreSQL list error, using local fallback:', dbErr.message);
+    }
+  }
+
   ensureDir();
   const files = fs.readdirSync(EVIDENCE_DIR);
   return files.filter(f => f.includes(trackingId));
 }
 
 /**
- * Verify integrity of an evidence file
+ * Generate an authorized, short-lived presigned URL for downloading evidence from S3.
+ * Defaults to 15 minutes (900 seconds) expiration.
+ */
+async function getEvidenceDownloadUrl(trackingId, fileName, expiresIn = 900) {
+  const s3Bucket = process.env.S3_EVIDENCE_BUCKET;
+  const s3Client = getS3Client();
+  if (!s3Client || !s3Bucket) {
+    return null;
+  }
+
+  const s3Key = `evidence/${trackingId}/${fileName}`;
+  const command = new GetObjectCommand({
+    Bucket: s3Bucket,
+    Key: s3Key
+  });
+
+  const url = await getSignedUrl(s3Client, command, { expiresIn });
+  return {
+    downloadUrl: url,
+    s3Key,
+    expiresInSeconds: expiresIn,
+    expiresAt: new Date(Date.now() + expiresIn * 1000).toISOString()
+  };
+}
+
+/**
+ * Verify integrity of an evidence file against expected SHA-256
  */
 function verifyIntegrity(fileName) {
   const filePath = path.join(EVIDENCE_DIR, fileName);
@@ -229,6 +299,7 @@ module.exports = {
   saveEvidence,
   createMetadata,
   listEvidence,
+  getEvidenceDownloadUrl,
   verifyIntegrity,
   EVIDENCE_DIR,
   MAX_RECORDING_MS
