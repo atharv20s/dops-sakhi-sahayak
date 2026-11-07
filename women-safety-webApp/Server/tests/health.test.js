@@ -1,6 +1,5 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const mongoose = require('mongoose');
 
 process.env.NODE_ENV = 'test';
 process.env.S3_EVIDENCE_BUCKET = '';
@@ -44,7 +43,5 @@ test('health endpoints return healthy responses', async (t) => {
         resolve();
       }
     });
-
-    await mongoose.disconnect();
   }
 });

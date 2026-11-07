@@ -2,7 +2,7 @@ name: Sakhi Sahayak - CI, ECR and Render CD
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/postgres-prisma-migration]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -24,6 +24,21 @@ jobs:
     permissions:
       contents: read
 
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgrespassword
+          POSTGRES_DB: sakhi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,8 +54,13 @@ jobs:
 
       - name: Install Backend Dependencies and Run All Tests
         working-directory: women-safety-webApp/Server
+        env:
+          DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/sakhi_test?schema=public
+          NODE_ENV: test
         run: |
           npm ci
+          npx prisma migrate deploy
+          node prisma/seed.js
           node --check index.js
           node --test tests/*.test.js
 

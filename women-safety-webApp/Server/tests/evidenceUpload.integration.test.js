@@ -2,7 +2,6 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const mongoose = require('mongoose');
 
 process.env.NODE_ENV = 'test';
 process.env.S3_EVIDENCE_BUCKET = ''; // Keep empty so dotenv does not repopulate it from .env
@@ -109,7 +108,5 @@ test('Evidence upload HTTP endpoint', async (t) => {
                 resolve();
             }
         });
-
-        await mongoose.disconnect();
     }
 });
