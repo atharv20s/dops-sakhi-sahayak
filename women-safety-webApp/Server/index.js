@@ -3,7 +3,6 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-const mongoose = require('mongoose');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -12,8 +11,8 @@ const bcrypt = require('bcryptjs');
 // ── Database Client (Prisma PostgreSQL) ──
 const { prisma, checkDatabaseHealth, isDatabaseConfigured } = require('./db');
 
-const User = require('./models/User');
-const PoliceStation = require('./models/PoliceStation');
+// ── Authentication & Rate Limiting ──
+const { generateToken, requireAuth, optionalAuth, createRateLimiter } = require('./auth');
 
 // ── LangGraph/Voice Agent Modules ──
 const voiceAgent = require('./voiceAgent');
@@ -24,9 +23,13 @@ const { dispatchFullEmergency, dispatchLiveLocation, EMERGENCY_EMAIL, EMERGENCY_
 const app = express();
 const server = http.createServer(app);
 
-// Cross-Origin configuration
+// Cross-Origin configuration with production restrictions
+const allowedOrigins = process.env.NODE_ENV === 'production' && process.env.FRONTEND_URL
+  ? process.env.FRONTEND_URL.split(',').map(s => s.trim())
+  : '*';
+
 const io = new Server(server, {
-  cors: { origin: '*', methods: ['GET', 'POST'] },
+  cors: { origin: allowedOrigins, methods: ['GET', 'POST'] },
   maxHttpBufferSize: 10 * 1024 * 1024 // 10MB for audio uploads
 });
 
@@ -50,10 +53,10 @@ if (process.env.REDIS_URL) {
     });
 }
 
-app.use(cors());
+app.use(cors({ origin: allowedOrigins }));
 app.use(express.json({ limit: '10mb' }));
 
-// Lightweight health check — intentionally independent of database connectivity.
+// Lightweight health check — process liveness
 const healthHandler = (req, res) => {
   res.status(200).json({
     status: 'healthy',
@@ -63,7 +66,7 @@ const healthHandler = (req, res) => {
   });
 };
 
-// Dependency readiness check — verifies PostgreSQL connectivity
+// Dependency readiness check — verifies PostgreSQL connectivity (fail-closed)
 const readyHandler = async (req, res) => {
   const dbHealth = await checkDatabaseHealth();
   if (dbHealth.ok) {
@@ -76,22 +79,11 @@ const readyHandler = async (req, res) => {
     });
   }
 
-  // In production, database is strictly required
-  if (process.env.NODE_ENV === 'production' || isDatabaseConfigured()) {
-    return res.status(503).json({
-      status: 'unready',
-      service: 'sakhi-backend',
-      database: 'disconnected',
-      error: dbHealth.error,
-      timestamp: new Date().toISOString()
-    });
-  }
-
-  // In local development without DATABASE_URL, indicate unconfigured
-  return res.status(200).json({
-    status: 'ready',
+  return res.status(503).json({
+    status: 'unready',
     service: 'sakhi-backend',
-    database: 'unconfigured (dev mode)',
+    database: 'disconnected',
+    error: dbHealth.error || 'PostgreSQL database connection required',
     timestamp: new Date().toISOString()
   });
 };
@@ -109,18 +101,7 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 } // 50MB max
 });
 
-let isMongoConnected = false;
-const memoryUsers = []; // Fallback memory database
-
-// MongoDB Connection
-mongoose.connect(process.env.MONGO_URI, {
-  serverSelectionTimeoutMS: 5000
-}).then(() => {
-  isMongoConnected = true;
-  console.log('✅ Connected explicitly to MongoDB (Sakhi Cluster)');
-}).catch(err => {
-  console.log('⚠️ MongoDB Blocked (IP Whitelist Issue). Using Memory Database for Demo.');
-});
+const memoryUsers = []; // Fallback memory database (development only)
 
 // ── Haversine distance formula ──
 function haversineDistance(lat1, lng1, lat2, lng2) {
@@ -224,8 +205,11 @@ async function findNearestPoliceStation(userLat, userLng) {
 // ═══════════════════════════════════════════════════════════════
 const router = express.Router();
 
-// ── Auth: Signup (bcryptjs work factor 12, zero plaintext leakage) ──
-router.post('/signup', async (req, res) => {
+// Rate limiter for authentication routes (max 25 requests per 15 mins per IP)
+const authLimiter = createRateLimiter(25, 15 * 60 * 1000);
+
+// ── Auth: Signup (bcryptjs work factor 12, secure token session, zero plaintext leakage) ──
+router.post('/signup', authLimiter, async (req, res) => {
   try {
     const { userName, userPhone, userPassword, emergencyName, emergencyPhone } = req.body || {};
     if (!userName || !userPhone || !userPassword) {
@@ -249,8 +233,11 @@ router.post('/signup', async (req, res) => {
         }
       });
 
+      const token = generateToken(newUser);
+
       return res.status(201).json({
         success: true,
+        token,
         user: {
           name: newUser.name,
           phone: newUser.phone,
@@ -275,6 +262,7 @@ router.post('/signup', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(String(userPassword), 12);
     const memUser = {
+      id: `mem-${Date.now()}`,
       name: userName,
       phone: userPhone,
       passwordHash,
@@ -282,8 +270,11 @@ router.post('/signup', async (req, res) => {
     };
     memoryUsers.push(memUser);
 
+    const token = generateToken(memUser);
+
     return res.status(201).json({
       success: true,
+      token,
       user: {
         name: memUser.name,
         phone: memUser.phone,
@@ -297,8 +288,8 @@ router.post('/signup', async (req, res) => {
   }
 });
 
-// ── Auth: Login (bcryptjs compare, zero password leakage) ──
-router.post('/login', async (req, res) => {
+// ── Auth: Login (bcryptjs compare, secure token session, zero password leakage) ──
+router.post('/login', authLimiter, async (req, res) => {
   try {
     const { userPhone, userPassword } = req.body || {};
     if (!userPhone || !userPassword) {
@@ -316,8 +307,11 @@ router.post('/login', async (req, res) => {
         return res.status(200).json({ success: false, msg: 'Invalid password!' });
       }
 
+      const token = generateToken(user);
+
       return res.status(200).json({
         success: true,
+        token,
         user: {
           name: user.name,
           phone: user.phone,
@@ -343,8 +337,11 @@ router.post('/login', async (req, res) => {
       : (memUser.password === userPassword);
     if (!match) return res.status(200).json({ success: false, msg: 'Invalid password!' });
 
+    const token = generateToken(memUser);
+
     return res.status(200).json({
       success: true,
+      token,
       user: {
         name: memUser.name,
         phone: memUser.phone,
@@ -475,11 +472,6 @@ router.get('/police-stations', async (req, res) => {
       }
     }
 
-    if (isMongoConnected) {
-      const stations = await PoliceStation.find({ category: 'station' }).select('-__v');
-      return res.json({ success: true, count: stations.length, stations });
-    }
-
     const data = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
     res.json({ success: true, count: (data.police_stations || []).length, stations: data.police_stations || [] });
   } catch (err) {
@@ -579,7 +571,7 @@ router.post('/transcribe', upload.single('audio'), async (req, res) => {
 });
 
 // ── Evidence Upload ──
-router.post('/upload-evidence', upload.single('evidence'), async (req, res) => {
+router.post('/upload-evidence', optionalAuth, upload.single('evidence'), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({
@@ -601,18 +593,13 @@ router.post('/upload-evidence', upload.single('evidence'), async (req, res) => {
       });
     }
 
+    const userId = req.user ? req.user.userId : null;
     const result = await saveEvidence(
       trackingId,
       req.file.buffer,
-      'webm'
+      'webm',
+      userId
     );
-
-    if (process.env.S3_EVIDENCE_BUCKET && !result.s3Url) {
-      return res.status(502).json({
-        success: false,
-        error: 'Evidence could not be uploaded to S3'
-      });
-    }
 
     return res.json({ success: true, ...result });
 
@@ -627,10 +614,11 @@ router.post('/upload-evidence', upload.single('evidence'), async (req, res) => {
 });
 
 // ── Evidence Listing ──
-router.get('/evidence/:trackingId', (req, res) => {
+router.get('/evidence/:trackingId', optionalAuth, async (req, res) => {
   try {
-    const files = listEvidence(req.params.trackingId);
-    res.json({ success: true, trackingId: req.params.trackingId, files });
+    const requestingUserId = req.user ? req.user.userId : null;
+    const files = await listEvidence(req.params.trackingId, requestingUserId);
+    res.json({ success: true, trackingId: req.params.trackingId, count: files.length, files });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -686,16 +674,50 @@ router.get('/trusted-services', (req, res) => {
 });
 
 // ── Evidence Download URL (Authorized Presigned S3 URL) ──
-router.get('/evidence/:trackingId/:fileName/url', async (req, res) => {
+router.get('/evidence/:trackingId/:fileName/url', requireAuth, async (req, res) => {
   try {
     const { trackingId, fileName } = req.params;
-    const result = await getEvidenceDownloadUrl(trackingId, fileName);
+    const requestingUserId = req.user?.userId;
+    const result = await getEvidenceDownloadUrl(trackingId, fileName, requestingUserId);
     if (!result) {
-      return res.status(404).json({ success: false, error: 'S3 presigned URL not available. Ensure S3_EVIDENCE_BUCKET is configured.' });
+      return res.status(501).json({ success: false, error: 'S3 presigned URL not available. Ensure S3_EVIDENCE_BUCKET is configured.' });
     }
     res.json({ success: true, ...result });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
+  }
+});
+
+// ── Evidence Presigned S3 URL by Evidence ID (Protected) ──
+router.get('/evidence/presign/:evidenceId', requireAuth, async (req, res) => {
+  try {
+    const { evidenceId } = req.params;
+    const requestingUserId = req.user?.userId;
+
+    if (!isDatabaseConfigured()) {
+      return res.status(501).json({ success: false, error: 'Database unconfigured for evidence metadata.' });
+    }
+
+    const record = await prisma.evidenceObject.findUnique({
+      where: { id: evidenceId }
+    });
+
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'Evidence record not found.' });
+    }
+
+    if (record.userId && requestingUserId && record.userId !== requestingUserId) {
+      return res.status(403).json({ success: false, error: 'Forbidden: You do not have permission to access this evidence.' });
+    }
+
+    const result = await getEvidenceDownloadUrl(record.trackingId, record.fileName, requestingUserId);
+    if (!result) {
+      return res.status(501).json({ success: false, error: 'S3 storage is not configured for presigned download.' });
+    }
+
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
   }
 });
 
@@ -898,12 +920,18 @@ io.on('connection', (socket) => {
   });
 
   // ── Evidence chunk upload via socket ──
-  socket.on('evidence-upload', (data) => {
-    const { trackingId, audioData, format } = data;
-    if (!audioData || !trackingId) return;
-    const buffer = Buffer.from(audioData);
-    saveEvidence(trackingId, buffer, format || 'webm');
-    console.log(`[BACKEND] 📦 Evidence chunk saved for ${trackingId}`);
+  socket.on('evidence-upload', async (data) => {
+    try {
+      const { trackingId, audioData, format, userId } = data || {};
+      if (!audioData || !trackingId) return;
+      const buffer = Buffer.from(audioData);
+      const result = await saveEvidence(trackingId, buffer, format || 'webm', userId || null);
+      console.log(`[BACKEND] 📦 Evidence chunk saved for ${trackingId}:`, result.evidenceId || result.filename);
+      socket.emit('evidence-saved', { success: true, trackingId, evidenceId: result.evidenceId });
+    } catch (err) {
+      console.error(`[BACKEND] ❌ Evidence chunk upload failed:`, err.message);
+      socket.emit('evidence-error', { success: false, error: err.message });
+    }
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -922,68 +950,9 @@ io.on('connection', (socket) => {
     console.log(`⏰ Time: ${new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' })}`);
 
     let nearestStation = null;
-
-    // Try MongoDB geospatial lookup
-    if (isMongoConnected) {
-      try {
-        const station = await PoliceStation.findOne({
-          location: {
-            $near: {
-              $geometry: { type: 'Point', coordinates: [userLng, userLat] },
-              $maxDistance: 50000
-            }
-          },
-          category: 'station'
-        });
-
-        if (station) {
-          const distance = haversineDistance(userLat, userLng, station.lat, station.lng);
-          nearestStation = {
-            name: station.name,
-            phone: station.phone,
-            email: station.email,
-            zone: station.zone,
-            officerInCharge: station.officerInCharge,
-            type: station.type,
-            lat: station.lat,
-            lng: station.lng,
-            distance,
-            distanceText: distance > 1 ? `${distance.toFixed(1)} km` : `${(distance * 1000).toFixed(0)} m`
-          };
-        }
-      } catch (err) {
-        console.log('⚠️ MongoDB lookup failed during SOS:', err.message);
-      }
-    }
-
-    // Fallback to JSON
-    if (!nearestStation) {
-      try {
-        const safetyData = JSON.parse(fs.readFileSync(path.join(__dirname, 'safety_data.json'), 'utf8'));
-        const stations = safetyData.police_stations || [];
-        let minDist = Infinity;
-
-        stations.forEach(s => {
-          const d = haversineDistance(userLat, userLng, s.lat, s.lng);
-          if (d < minDist) {
-            minDist = d;
-            nearestStation = {
-              name: s.name,
-              phone: [s.contact].filter(Boolean),
-              email: s.email || '',
-              zone: '',
-              officerInCharge: '',
-              type: 'city',
-              lat: s.lat,
-              lng: s.lng,
-              distance: d,
-              distanceText: d > 1 ? `${d.toFixed(1)} km` : `${(d * 1000).toFixed(0)} m`
-            };
-          }
-        });
-      } catch (jsonErr) {
-        console.log('⚠️ JSON fallback also failed:', jsonErr.message);
-      }
+    const nearestResult = await findNearestPoliceStation(userLat, userLng);
+    if (nearestResult && nearestResult.station) {
+      nearestStation = nearestResult.station;
     }
 
     if (nearestStation) {

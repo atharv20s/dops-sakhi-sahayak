@@ -21,15 +21,21 @@ test('PostgreSQL migration & security verification suite', async (t) => {
     io.close();
   });
 
-  // ── 1. Readiness Probe ──
-  await t.test('GET /ready and GET /api/ready return readiness status', async () => {
+  // ── 1. Readiness Probe (Fail-Closed Enforcement) ──
+  await t.test('GET /ready and GET /api/ready return readiness status and fail-closed without DB', async () => {
     for (const path of ['/ready', '/api/ready']) {
       const res = await fetch(`${baseUrl}${path}`);
-      assert.equal(res.status, 200);
-      const data = await res.json();
-      assert.equal(data.status, 'ready');
-      assert.equal(data.service, 'sakhi-backend');
-      assert.ok(data.timestamp);
+      if (res.status === 200) {
+        const data = await res.json();
+        assert.equal(data.status, 'ready');
+        assert.equal(data.service, 'sakhi-backend');
+        assert.equal(data.database, 'connected');
+      } else {
+        assert.equal(res.status, 503, 'Without database connection, readiness probe must fail-closed with HTTP 503');
+        const data = await res.json();
+        assert.equal(data.status, 'unready');
+        assert.equal(data.database, 'disconnected');
+      }
     }
   });
 

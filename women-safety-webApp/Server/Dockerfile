@@ -1,20 +1,34 @@
-FROM node:24-alpine
+# Multi-stage build for Sakhi Sahayak Backend
+# Stage 1: Build & Prisma Generate
+FROM node:24-alpine AS builder
 
 WORKDIR /app
 
-# Install build dependencies if needed
 RUN apk add --no-cache python3 make g++
 
 COPY package*.json ./
+COPY prisma ./prisma/
 
-RUN npm ci --omit=dev
+# Install all dependencies (including prisma CLI devDependency)
+RUN npm ci
 
-COPY . .
-
-# Generate Prisma Client
+# Generate Prisma Client (outputs to node_modules/@prisma/client and .prisma)
 RUN npx prisma generate
 
+# Prune dev dependencies keeping the generated prisma client
+RUN npm prune --omit=dev
+
+# Stage 2: Production Runner
+FROM node:24-alpine AS runner
+
+WORKDIR /app
+
+ENV NODE_ENV=production
 ENV PORT=5001
+
+# Copy production node_modules from builder (includes generated prisma client)
+COPY --from=builder /app/node_modules ./node_modules
+COPY . .
 
 EXPOSE 5001
 
