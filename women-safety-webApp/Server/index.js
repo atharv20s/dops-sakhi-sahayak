@@ -6,13 +6,26 @@ const { Server } = require('socket.io');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 
 // ── Database Client (Prisma PostgreSQL) ──
 const { prisma, checkDatabaseHealth, isDatabaseConfigured } = require('./db');
 
 // ── Authentication & Rate Limiting ──
-const { generateToken, requireAuth, optionalAuth, createRateLimiter } = require('./auth');
+const {
+  getJwtSecret,
+  generateToken,
+  verifyToken,
+  revokeToken,
+  requireAuth,
+  optionalAuth,
+  createRateLimiter,
+  constantTimeEquals
+} = require('./auth');
+
+// Fail fast on startup in production if JWT_SECRET is missing or insufficiently strong
+getJwtSecret();
 
 // ── LangGraph/Voice Agent Modules ──
 const voiceAgent = require('./voiceAgent');
@@ -31,6 +44,18 @@ const allowedOrigins = process.env.NODE_ENV === 'production' && process.env.FRON
 const io = new Server(server, {
   cors: { origin: allowedOrigins, methods: ['GET', 'POST'] },
   maxHttpBufferSize: 10 * 1024 * 1024 // 10MB for audio uploads
+});
+
+// Socket.IO authentication middleware: populates verified user session from handshake
+io.use((socket, next) => {
+  const token = socket.handshake?.auth?.token;
+  if (token) {
+    const user = verifyToken(token);
+    if (user) {
+      socket.user = user;
+    }
+  }
+  next();
 });
 
 // Setup Redis Adapter for multi-server WebSocket scaling if REDIS_URL is provided
@@ -355,6 +380,18 @@ router.post('/login', authLimiter, async (req, res) => {
   }
 });
 
+// ── Auth: Logout / Session Revocation (persists revoked token hash) ──
+router.post('/logout', requireAuth, async (req, res) => {
+  try {
+    if (req.token) {
+      await revokeToken(req.token);
+    }
+    res.json({ success: true, msg: 'Session successfully revoked. Logged out.' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
 // ── Safety Data ──
 router.get('/danger-zones', (req, res) => {
   try {
@@ -580,9 +617,8 @@ router.post('/upload-evidence', optionalAuth, upload.single('evidence'), async (
       });
     }
 
-    const trackingId = req.body.trackingId || 'UNKNOWN';
+    const { trackingId, trackingSecret, format } = req.body || {};
 
-    // Validate client input before writing any files.
     if (
       typeof trackingId !== 'string' ||
       !/^[a-zA-Z0-9_-]{1,100}$/.test(trackingId)
@@ -593,12 +629,14 @@ router.post('/upload-evidence', optionalAuth, upload.single('evidence'), async (
       });
     }
 
-    const userId = req.user ? req.user.userId : null;
+    // Authenticated user identity comes strictly from verified session
+    const verifiedUserId = req.user ? req.user.userId : null;
     const result = await saveEvidence(
       trackingId,
       req.file.buffer,
-      'webm',
-      userId
+      format || 'webm',
+      verifiedUserId,
+      trackingSecret || null
     );
 
     return res.json({ success: true, ...result });
@@ -606,7 +644,7 @@ router.post('/upload-evidence', optionalAuth, upload.single('evidence'), async (
   } catch (err) {
     console.error('[Evidence Upload] Error:', err.message);
 
-    return res.status(500).json({
+    return res.status(err.statusCode || 500).json({
       success: false,
       error: err.message
     });
@@ -617,10 +655,11 @@ router.post('/upload-evidence', optionalAuth, upload.single('evidence'), async (
 router.get('/evidence/:trackingId', optionalAuth, async (req, res) => {
   try {
     const requestingUserId = req.user ? req.user.userId : null;
-    const files = await listEvidence(req.params.trackingId, requestingUserId);
+    const trackingSecret = req.headers['x-tracking-secret'] || req.query.secret || null;
+    const files = await listEvidence(req.params.trackingId, requestingUserId, trackingSecret);
     res.json({ success: true, trackingId: req.params.trackingId, count: files.length, files });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(err.statusCode || 500).json({ success: false, error: err.message });
   }
 });
 
@@ -674,11 +713,43 @@ router.get('/trusted-services', (req, res) => {
 });
 
 // ── Evidence Download URL (Authorized Presigned S3 URL) ──
-router.get('/evidence/:trackingId/:fileName/url', requireAuth, async (req, res) => {
+router.get('/evidence/:trackingId/:fileName/url', optionalAuth, async (req, res) => {
   try {
     const { trackingId, fileName } = req.params;
-    const requestingUserId = req.user?.userId;
-    const result = await getEvidenceDownloadUrl(trackingId, fileName, requestingUserId);
+    const requestingUserId = req.user?.userId || null;
+    const trackingSecret = req.headers['x-tracking-secret'] || req.query.secret || null;
+
+    if (!isDatabaseConfigured()) {
+      return res.status(501).json({ success: false, error: 'Database unconfigured for evidence metadata.' });
+    }
+
+    const record = await prisma.evidenceObject.findFirst({
+      where: { trackingId, fileName }
+    });
+
+    if (!record) {
+      return res.status(404).json({ success: false, error: 'Evidence record not found.' });
+    }
+
+    // Strict Authorization Check:
+    if (record.userId) {
+      if (!requestingUserId) {
+        return res.status(401).json({ success: false, error: 'Authentication required to access this evidence.' });
+      }
+      if (record.userId !== requestingUserId) {
+        return res.status(403).json({ success: false, error: 'Forbidden: You do not have permission to access this evidence.' });
+      }
+    } else {
+      const expectedHash = record.metadata?.trackingSecretHash;
+      if (expectedHash) {
+        const providedHash = trackingSecret ? crypto.createHash('sha256').update(trackingSecret).digest('hex') : null;
+        if (!providedHash || !constantTimeEquals(providedHash, expectedHash)) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Valid emergency tracking secret required for anonymous evidence.' });
+        }
+      }
+    }
+
+    const result = await getEvidenceDownloadUrl(trackingId, fileName, requestingUserId, trackingSecret);
     if (!result) {
       return res.status(501).json({ success: false, error: 'S3 presigned URL not available. Ensure S3_EVIDENCE_BUCKET is configured.' });
     }
@@ -689,10 +760,11 @@ router.get('/evidence/:trackingId/:fileName/url', requireAuth, async (req, res) 
 });
 
 // ── Evidence Presigned S3 URL by Evidence ID (Protected) ──
-router.get('/evidence/presign/:evidenceId', requireAuth, async (req, res) => {
+router.get('/evidence/presign/:evidenceId', optionalAuth, async (req, res) => {
   try {
     const { evidenceId } = req.params;
-    const requestingUserId = req.user?.userId;
+    const requestingUserId = req.user?.userId || null;
+    const trackingSecret = req.headers['x-tracking-secret'] || req.query.secret || null;
 
     if (!isDatabaseConfigured()) {
       return res.status(501).json({ success: false, error: 'Database unconfigured for evidence metadata.' });
@@ -706,11 +778,25 @@ router.get('/evidence/presign/:evidenceId', requireAuth, async (req, res) => {
       return res.status(404).json({ success: false, error: 'Evidence record not found.' });
     }
 
-    if (record.userId && requestingUserId && record.userId !== requestingUserId) {
-      return res.status(403).json({ success: false, error: 'Forbidden: You do not have permission to access this evidence.' });
+    // Strict Authorization Check:
+    if (record.userId) {
+      if (!requestingUserId) {
+        return res.status(401).json({ success: false, error: 'Authentication required to access this evidence.' });
+      }
+      if (record.userId !== requestingUserId) {
+        return res.status(403).json({ success: false, error: 'Forbidden: You do not have permission to access this evidence.' });
+      }
+    } else {
+      const expectedHash = record.metadata?.trackingSecretHash;
+      if (expectedHash) {
+        const providedHash = trackingSecret ? crypto.createHash('sha256').update(trackingSecret).digest('hex') : null;
+        if (!providedHash || !constantTimeEquals(providedHash, expectedHash)) {
+          return res.status(403).json({ success: false, error: 'Forbidden: Valid emergency tracking secret required for anonymous evidence.' });
+        }
+      }
     }
 
-    const result = await getEvidenceDownloadUrl(record.trackingId, record.fileName, requestingUserId);
+    const result = await getEvidenceDownloadUrl(record.trackingId, record.fileName, requestingUserId, trackingSecret);
     if (!result) {
       return res.status(501).json({ success: false, error: 'S3 storage is not configured for presigned download.' });
     }
@@ -739,8 +825,19 @@ router.get('/safety-reports', async (req, res) => {
         }));
         return res.json({ success: true, count: reports.length, reports });
       } catch (dbErr) {
-        console.warn('⚠️ PostgreSQL safety reports query error, using fallback:', dbErr.message);
+        console.error('❌ PostgreSQL safety reports query error:', dbErr.message);
+        return res.status(503).json({
+          success: false,
+          error: 'Database unavailable. Dynamic safety reports cannot be loaded.'
+        });
       }
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({
+        success: false,
+        error: 'Database connection required in production to read safety reports.'
+      });
     }
 
     const data = readJsonFile(REPORTS_FILE, { reports: [] });
@@ -775,29 +872,44 @@ router.post('/safety-reports', async (req, res) => {
     const storedLng = exact ? parsedLng : null;
 
     if (isDatabaseConfigured()) {
-      const report = await prisma.safetyReport.create({
-        data: {
-          category: String(category).slice(0, 50),
-          locality: String(locality || 'Area withheld').slice(0, 150),
-          description: String(description).slice(0, 800),
-          lat: storedLat,
-          lng: storedLng,
-          shareExact: exact
-        }
-      });
+      try {
+        const report = await prisma.safetyReport.create({
+          data: {
+            category: String(category).slice(0, 50),
+            locality: String(locality || 'Area withheld').slice(0, 150),
+            description: String(description).slice(0, 800),
+            lat: storedLat,
+            lng: storedLng,
+            shareExact: exact
+          }
+        });
 
-      return res.status(201).json({
-        success: true,
-        msg: 'Report saved. No name or phone was stored.',
-        report: {
-          id: report.id,
-          category: report.category,
-          locality: report.locality,
-          description: report.description,
-          lat: report.lat,
-          lng: report.lng,
-          createdAt: report.createdAt
-        }
+        return res.status(201).json({
+          success: true,
+          msg: 'Report saved. No name or phone was stored.',
+          report: {
+            id: report.id,
+            category: report.category,
+            locality: report.locality,
+            description: report.description,
+            lat: report.lat,
+            lng: report.lng,
+            createdAt: report.createdAt
+          }
+        });
+      } catch (dbErr) {
+        console.error('❌ PostgreSQL safety report creation error:', dbErr.message);
+        return res.status(503).json({
+          success: false,
+          error: 'Database write failed. Report could not be recorded.'
+        });
+      }
+    }
+
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(503).json({
+        success: false,
+        error: 'Database connection required in production. Local file persistence is disabled.'
       });
     }
 
@@ -819,7 +931,7 @@ router.post('/safety-reports', async (req, res) => {
 
     res.status(201).json({
       success: true,
-      msg: 'Report saved. No name or phone was stored.',
+      msg: 'Report saved (Dev File Fallback). No name or phone was stored.',
       report: {
         id: report.id,
         category: report.category,
@@ -922,12 +1034,34 @@ io.on('connection', (socket) => {
   // ── Evidence chunk upload via socket ──
   socket.on('evidence-upload', async (data) => {
     try {
-      const { trackingId, audioData, format, userId } = data || {};
+      const { trackingId, audioData, format, trackingSecret } = data || {};
       if (!audioData || !trackingId) return;
       const buffer = Buffer.from(audioData);
-      const result = await saveEvidence(trackingId, buffer, format || 'webm', userId || null);
-      console.log(`[BACKEND] 📦 Evidence chunk saved for ${trackingId}:`, result.evidenceId || result.filename);
-      socket.emit('evidence-saved', { success: true, trackingId, evidenceId: result.evidenceId });
+
+      // Verify user identity strictly through authenticated socket session (never trust client payload)
+      let verifiedUserId = null;
+      if (socket.user?.userId) {
+        verifiedUserId = socket.user.userId;
+      } else if (socket.handshake?.auth?.token) {
+        const payload = verifyToken(socket.handshake.auth.token);
+        if (payload) verifiedUserId = payload.userId;
+      }
+
+      const result = await saveEvidence(
+        trackingId,
+        buffer,
+        format || 'webm',
+        verifiedUserId,
+        trackingSecret || null
+      );
+
+      console.log(`[BACKEND] 📦 Evidence chunk saved for ${trackingId}:`, result.evidenceId || result.fileName);
+      socket.emit('evidence-saved', {
+        success: true,
+        trackingId,
+        evidenceId: result.evidenceId,
+        trackingSecret: result.trackingSecret || null
+      });
     } catch (err) {
       console.error(`[BACKEND] ❌ Evidence chunk upload failed:`, err.message);
       socket.emit('evidence-error', { success: false, error: err.message });

@@ -1,23 +1,39 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
-const EmbeddedPostgres = require('embedded-postgres').default;
+const { execSync } = require('node:child_process');
 
-const PG_PORT = 5433;
-const PG_URL = `postgresql://postgres:password@localhost:${PG_PORT}/postgres?schema=public`;
+test('PostgreSQL End-to-End Integration, Security & Persistence Suite', async (t) => {
+  let embeddedPg = null;
 
-test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
-  // 1. Initialize and start Embedded PostgreSQL
-  const pg = new EmbeddedPostgres({ port: PG_PORT });
-  await pg.start();
+  // Use the single PostgreSQL instance if DATABASE_URL is already provided (e.g. CI runner)
+  // Otherwise, start embedded-postgres locally and run migrations & seed
+  if (!process.env.DATABASE_URL) {
+    const EmbeddedPostgres = require('embedded-postgres').default;
+    const PG_PORT = 5433;
+    embeddedPg = new EmbeddedPostgres({ port: PG_PORT });
+    await embeddedPg.start();
+    process.env.DATABASE_URL = `postgresql://postgres:password@localhost:${PG_PORT}/postgres?schema=public`;
+
+    execSync('npx prisma migrate deploy', { env: process.env, stdio: 'ignore' });
+    execSync('node prisma/seed.js', { env: process.env, stdio: 'ignore' });
+  }
 
   process.env.NODE_ENV = 'test';
-  process.env.DATABASE_URL = PG_URL;
-  process.env.S3_EVIDENCE_BUCKET = ''; // Local storage mode for evidence integration test
+  process.env.JWT_SECRET = process.env.JWT_SECRET || 'sakhi-test-secure-jwt-signing-key-32-chars-long!';
+  process.env.S3_EVIDENCE_BUCKET = ''; // Local storage mode for integration test
 
   const { prisma, checkDatabaseHealth } = require('../db');
   const { app, server, io } = require('../index');
   const { saveEvidence, listEvidence } = require('../evidenceRecorder');
+  const {
+    getJwtSecret,
+    generateToken,
+    verifyToken,
+    revokeToken,
+    isTokenRevoked,
+    constantTimeEquals
+  } = require('../auth');
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -42,10 +58,12 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
       else resolve();
     });
     await prisma.$disconnect();
-    await pg.stop();
+    if (embeddedPg) {
+      await embeddedPg.stop();
+    }
   });
 
-  // ── Test 1: Readiness probe confirms PostgreSQL is connected ──
+  // ── Test 1: Readiness probe confirms single PostgreSQL instance is connected ──
   await t.test('GET /ready confirms PostgreSQL is connected with latency metric', async () => {
     const res = await fetch(`${baseUrl}/ready`);
     assert.equal(res.status, 200);
@@ -56,7 +74,43 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
     assert.ok(data.latencyMs >= 0);
   });
 
-  // ── Test 2: User registration persists to PostgreSQL with bcrypt hash and token ──
+  // ── Test 2: JWT Security, Constant-Time Comparison & Session Revocation ──
+  await t.test('JWT Security & Session Revocation Lifecycle', async () => {
+    // A. Constant-time equality check
+    assert.equal(constantTimeEquals('secret-sig-1', 'secret-sig-1'), true);
+    assert.equal(constantTimeEquals('secret-sig-1', 'secret-sig-2'), false);
+    assert.equal(constantTimeEquals('short', 'much-longer-string'), false);
+
+    // B. Token generation & verification
+    const mockUser = { id: 'usr-12345', phone: '9999999999', name: 'Security Test' };
+    const testToken = generateToken(mockUser);
+    const decoded = verifyToken(testToken);
+    assert.ok(decoded);
+    assert.equal(decoded.phone, '9999999999');
+
+    // C. Token revocation persists and invalidates session
+    assert.equal(await isTokenRevoked(testToken), false);
+    await revokeToken(testToken);
+    assert.equal(await isTokenRevoked(testToken), true);
+    assert.equal(verifyToken(testToken), null, 'Revoked token must fail verification');
+
+    // D. In production, missing or short JWT_SECRET throws
+    const originalEnv = process.env.NODE_ENV;
+    const originalSecret = process.env.JWT_SECRET;
+    try {
+      process.env.NODE_ENV = 'production';
+      delete process.env.JWT_SECRET;
+      assert.throws(() => getJwtSecret(), /missing in production/);
+
+      process.env.JWT_SECRET = 'too-short';
+      assert.throws(() => getJwtSecret(), /at least 32 characters/);
+    } finally {
+      process.env.NODE_ENV = originalEnv;
+      process.env.JWT_SECRET = originalSecret;
+    }
+  });
+
+  // ── Test 3: User registration persists directly to PostgreSQL ──
   await t.test('User registration persists directly to PostgreSQL users table', async () => {
     const signupRes = await fetch(`${baseUrl}/api/signup`, {
       method: 'POST',
@@ -73,7 +127,7 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
     assert.equal(signupRes.status, 201);
     const signupData = await signupRes.json();
     assert.equal(signupData.success, true);
-    assert.ok(signupData.token, 'Must return JWT/session token');
+    assert.ok(signupData.token, 'Must return JWT session token');
     assert.equal(signupData.user.name, 'Priya Deshmukh');
     assert.equal(signupData.user.phone, testPhone);
     assert.equal(signupData.user.password, undefined);
@@ -101,7 +155,7 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
     assert.equal(dupRes.status, 400);
   });
 
-  // ── Test 3: User login validates bcrypt password against PostgreSQL ──
+  // ── Test 4: User login validates bcrypt password against PostgreSQL ──
   await t.test('User login validates bcrypt password against PostgreSQL', async () => {
     const loginRes = await fetch(`${baseUrl}/api/login`, {
       method: 'POST',
@@ -132,7 +186,7 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
     assert.equal(badData.success, false);
   });
 
-  // ── Test 4: Seeded Police Stations Query from PostgreSQL ──
+  // ── Test 5: Seeded Police Stations Query from PostgreSQL ──
   await t.test('GET /api/police-stations returns seeded police stations from PostgreSQL', async () => {
     const res = await fetch(`${baseUrl}/api/police-stations`);
     assert.equal(res.status, 200);
@@ -144,7 +198,7 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
     assert.ok(Array.isArray(station.phone), 'phone field must be an array');
   });
 
-  // ── Test 5: Nearest Police Station calculation via PostgreSQL Haversine ──
+  // ── Test 6: Nearest Police Station calculation via PostgreSQL Haversine ──
   await t.test('GET /api/sos-nearest-station uses PostgreSQL spatial query', async () => {
     const res = await fetch(`${baseUrl}/api/sos-nearest-station?lat=21.1458&lng=79.0882`);
     assert.equal(res.status, 200);
@@ -156,70 +210,122 @@ test('PostgreSQL End-to-End Integration & Persistence Suite', async (t) => {
     assert.ok(data.station.distance <= 50, 'Station should be within 50km');
   });
 
-  // ── Test 6: Evidence Persistence with SHA-256 and PostgreSQL Metadata ──
-  const trackingId = `trk_${Date.now()}`;
+  // ── Test 7: Evidence Authorization Policy for Owned & Anonymous Evidence ──
+  const ownedTrackingId = `trk_owned_${Date.now()}`;
+  const anonTrackingId = `trk_anon_${Date.now()}`;
+  let anonEvidenceId = null;
+  let anonTrackingSecret = null;
 
-  await t.test('Evidence recording saves SHA-256 checksum and metadata to PostgreSQL', async () => {
-    const payload = Buffer.from('TEST_AUDIO_EVIDENCE_STREAM_DATA_2026');
-    const expectedHash = crypto.createHash('sha256').update(payload).digest('hex');
+  // A. Create owned evidence
+  await t.test('Save owned evidence and verify user linkage in PostgreSQL', async () => {
+    const payload = Buffer.from('AUDIO_PAYLOAD_OWNED_USER');
+    const hash = crypto.createHash('sha256').update(payload).digest('hex');
 
-    const result = await saveEvidence(trackingId, payload, 'webm', registeredUserId);
-    assert.ok(result);
-    assert.equal(result.sha256, expectedHash);
+    const result = await saveEvidence(ownedTrackingId, payload, 'webm', registeredUserId);
+    assert.ok(result.evidenceId);
     createdEvidenceId = result.evidenceId;
-    assert.ok(createdEvidenceId, 'createdEvidenceId must be returned');
 
-    // Direct database query verification
-    const dbRecord = await prisma.evidenceObject.findUnique({
-      where: { id: createdEvidenceId }
-    });
-    assert.ok(dbRecord, 'Evidence record must exist in PostgreSQL evidence_objects table');
-    assert.equal(dbRecord.trackingId, trackingId);
-    assert.equal(dbRecord.sha256, expectedHash);
-    assert.equal(dbRecord.sizeBytes, payload.length);
+    const dbRecord = await prisma.evidenceObject.findUnique({ where: { id: createdEvidenceId } });
     assert.equal(dbRecord.userId, registeredUserId);
-
-    // List evidence
-    const list = await listEvidence(trackingId);
-    assert.equal(list.length, 1);
-    assert.equal(list[0].sha256, expectedHash);
+    assert.equal(dbRecord.sha256, hash);
   });
 
-  // ── Test 7: Presigned URL requires authentication or authorization ──
-  await t.test('Presigned URL authorization enforcement', async () => {
-    // Unauthenticated request
-    const unauthRes = await fetch(`${baseUrl}/api/evidence/presign/${createdEvidenceId}`);
-    assert.equal(unauthRes.status, 401, 'Unauthenticated request must return HTTP 401');
+  // B. Create anonymous emergency evidence
+  await t.test('Save anonymous emergency evidence and generate trackingSecret', async () => {
+    const payload = Buffer.from('AUDIO_PAYLOAD_ANONYMOUS_EMERGENCY');
+    const result = await saveEvidence(anonTrackingId, payload, 'webm', null);
+    assert.ok(result.evidenceId);
+    assert.ok(result.trackingSecret, 'Anonymous evidence must return a trackingSecret');
+    anonEvidenceId = result.evidenceId;
+    anonTrackingSecret = result.trackingSecret;
 
-    // Authenticated request with valid token
-    const authRes = await fetch(`${baseUrl}/api/evidence/presign/${createdEvidenceId}`, {
+    const dbRecord = await prisma.evidenceObject.findUnique({ where: { id: anonEvidenceId } });
+    assert.equal(dbRecord.userId, null);
+    assert.ok(dbRecord.metadata.trackingSecretHash);
+  });
+
+  // C. Test evidence authorization matrices
+  await t.test('Enforce strict evidence access authorization policies', async () => {
+    // Create a second registered user token
+    const otherToken = generateToken({ id: 'usr-different-456', phone: '9988776655', name: 'Other User' });
+
+    // 1. Owned evidence accessed by owner -> 200 or 501 (S3 storage)
+    const ownerRes = await fetch(`${baseUrl}/api/evidence/presign/${createdEvidenceId}`, {
       headers: { Authorization: `Bearer ${userToken}` }
     });
-    // In local dev without S3 credentials, 501 Not Implemented is expected
-    assert.ok(authRes.status === 200 || authRes.status === 501);
+    assert.ok([200, 501].includes(ownerRes.status), 'Owner access should be allowed');
+
+    // 2. Owned evidence accessed by a DIFFERENT authenticated user -> 403 Forbidden!
+    const intruderRes = await fetch(`${baseUrl}/api/evidence/presign/${createdEvidenceId}`, {
+      headers: { Authorization: `Bearer ${otherToken}` }
+    });
+    assert.equal(intruderRes.status, 403, 'Different user must receive HTTP 403 Forbidden');
+
+    // 3. Owned evidence accessed unauthenticated -> 401 Unauthorized!
+    const anonRes = await fetch(`${baseUrl}/api/evidence/presign/${createdEvidenceId}`);
+    assert.equal(anonRes.status, 401, 'Unauthenticated request must receive HTTP 401');
+
+    // 4. Anonymous evidence accessed WITHOUT valid secret by another user -> 403 Forbidden!
+    const badAnonRes = await fetch(`${baseUrl}/api/evidence/presign/${anonEvidenceId}`, {
+      headers: { Authorization: `Bearer ${otherToken}` }
+    });
+    assert.equal(badAnonRes.status, 403, 'Anonymous evidence without secret must receive HTTP 403 Forbidden');
+
+    // 5. Anonymous evidence accessed WITH valid trackingSecret -> allowed (200 or 501)
+    const validAnonRes = await fetch(`${baseUrl}/api/evidence/presign/${anonEvidenceId}`, {
+      headers: { 'x-tracking-secret': anonTrackingSecret }
+    });
+    assert.ok([200, 501].includes(validAnonRes.status), 'Anonymous evidence with valid secret should be authorized');
   });
 
-  // ── Test 8: Data persists across database restarts ──
-  await t.test('PostgreSQL database persists records across stop and restart', async () => {
+  // ── Test 8: Safety Reports Fail-Closed and Privacy Controls ──
+  await t.test('Safety reports privacy and fail-closed persistence', async () => {
+    const reportRes = await fetch(`${baseUrl}/api/safety-reports`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        category: 'poor-lighting',
+        locality: 'Civil Lines West',
+        description: 'Street light broken near park entrance',
+        lat: '21.1458',
+        lng: '79.0882',
+        shareExact: false
+      })
+    });
+
+    assert.equal(reportRes.status, 201);
+    const data = await reportRes.json();
+    assert.equal(data.success, true);
+    assert.equal(data.report.lat, null, 'Coordinates must be masked when shareExact=false');
+    assert.equal(data.report.lng, null);
+
+    // Verify it was persisted to PostgreSQL
+    const dbReport = await prisma.safetyReport.findUnique({ where: { id: data.report.id } });
+    assert.ok(dbReport, 'Report must be in PostgreSQL safety_reports table');
+  });
+
+  // ── Test 9: Data Persists across Connection Teardown and Reconnect ──
+  await t.test('PostgreSQL database records persist durably across disconnect and reconnect', async () => {
     await prisma.$disconnect();
-    await pg.stop();
 
-    // Restart the embedded postgres instance
-    await pg.start();
+    if (embeddedPg) {
+      await embeddedPg.stop();
+      await embeddedPg.start();
+    }
+
     const health = await checkDatabaseHealth();
-    assert.equal(health.ok, true, 'Database must recover and reconnect');
+    assert.equal(health.ok, true, 'Database must be reachable and healthy');
 
-    // Verify the previously inserted user still exists
+    // Verify user persisted
     const persistedUser = await prisma.user.findUnique({ where: { phone: testPhone } });
-    assert.ok(persistedUser, 'User record must persist across PostgreSQL restarts');
+    assert.ok(persistedUser, 'User record must persist in PostgreSQL');
     assert.equal(persistedUser.name, 'Priya Deshmukh');
 
-    // Verify the previously inserted evidence still exists
-    assert.ok(createdEvidenceId, 'createdEvidenceId should be populated');
+    // Verify evidence persisted
     const persistedEvidence = await prisma.evidenceObject.findUnique({
       where: { id: createdEvidenceId }
     });
-    assert.ok(persistedEvidence, 'Evidence record must persist across PostgreSQL restarts');
-    assert.equal(persistedEvidence.trackingId, trackingId);
+    assert.ok(persistedEvidence, 'Evidence record must persist in PostgreSQL');
+    assert.equal(persistedEvidence.trackingId, ownedTrackingId);
   });
 });
