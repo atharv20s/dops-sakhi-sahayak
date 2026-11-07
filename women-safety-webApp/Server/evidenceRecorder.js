@@ -30,69 +30,144 @@ function ensureDir() {
 }
 
 /**
- * Upload buffer or JSON directly to AWS S3
+ * Upload buffer or JSON directly to AWS S3.
+ * Throws on failure so callers cannot silently report success.
  */
 async function uploadToS3(key, body, contentType) {
   if (!s3Client || !S3_BUCKET_NAME) return null;
-  try {
-    const command = new PutObjectCommand({
-      Bucket: S3_BUCKET_NAME,
-      Key: key,
-      Body: body,
-      ContentType: contentType,
-      ServerSideEncryption: 'AES256'
-    });
-    await s3Client.send(command);
-    const s3Url = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
-    console.log(`[EvidenceRecorder] ☁️ Uploaded to S3: ${s3Url}`);
-    return s3Url;
-  } catch (err) {
-    console.error(`[EvidenceRecorder] ❌ S3 upload failed for ${key}:`, err.message);
-    return null;
-  }
+
+  const command = new PutObjectCommand({
+    Bucket: S3_BUCKET_NAME,
+    Key: key,
+    Body: body,
+    ContentType: contentType,
+    ServerSideEncryption: 'AES256'
+  });
+
+  await s3Client.send(command);
+
+  const s3Url = `https://${S3_BUCKET_NAME}.s3.${AWS_REGION}.amazonaws.com/${key}`;
+  console.log(`[EvidenceRecorder] ☁️ Uploaded to S3: ${key}`);
+  return s3Url;
 }
 
 /**
- * Save an evidence audio file (Local disk + AWS S3 backup)
+ * Save evidence locally and upload audio + metadata to S3.
+ * Success in S3 mode means BOTH objects were uploaded.
  */
 async function saveEvidence(trackingId, audioBuffer, format = 'webm') {
+  if (
+    typeof trackingId !== 'string' ||
+    !/^[a-zA-Z0-9_-]{1,100}$/.test(trackingId)
+  ) {
+    throw new Error('Invalid tracking ID');
+  }
+
   ensureDir();
 
   const timestamp = Date.now();
   const fileName = `evidence_${trackingId}_${timestamp}.${format}`;
   const filePath = path.join(EVIDENCE_DIR, fileName);
 
-  // Write audio locally
+  // Save local copy
   fs.writeFileSync(filePath, audioBuffer);
 
-  // Compute SHA-256 hash for forensic chain of custody
-  const hash = crypto.createHash('sha256').update(audioBuffer).digest('hex');
+  // Calculate SHA-256
+  const hash = crypto
+    .createHash('sha256')
+    .update(audioBuffer)
+    .digest('hex');
 
-  // Async push to AWS S3 if active
-  const s3AudioKey = `evidence/${trackingId}/${fileName}`;
-  const s3Url = await uploadToS3(s3AudioKey, audioBuffer, `audio/${format}`);
+  let s3Url = null;
 
-  // Write metadata sidecar
+  if (s3Client && S3_BUCKET_NAME) {
+    const s3AudioKey = `evidence/${trackingId}/${fileName}`;
+
+    // Upload audio first. Failure propagates.
+    s3Url = await uploadToS3(
+      s3AudioKey,
+      audioBuffer,
+      `audio/${format}`
+    );
+
+    const metadata = {
+      trackingId,
+      fileName,
+      format,
+      sizeBytes: audioBuffer.length,
+      sha256: hash,
+      s3Url,
+      createdAt: new Date().toISOString(),
+      hashCalculated: true
+    };
+
+    const metadataPath = `${filePath}.json`;
+
+    fs.writeFileSync(
+      metadataPath,
+      JSON.stringify(metadata, null, 2)
+    );
+
+    const s3MetaKey = `${s3AudioKey}.json`;
+
+    try {
+      // Metadata must also upload successfully.
+      await uploadToS3(
+        s3MetaKey,
+        JSON.stringify(metadata, null, 2),
+        'application/json'
+      );
+    } catch (error) {
+      console.error(
+        `[EvidenceRecorder] Metadata upload failed. Audio object may remain in S3: ${s3AudioKey}`
+      );
+      throw error;
+    }
+
+    console.log(
+      `[EvidenceRecorder] ✅ Audio and metadata persisted to S3: ${fileName}`
+    );
+
+    return {
+      filePath,
+      metadataPath,
+      hash,
+      fileName,
+      s3Url,
+      s3MetadataKey: s3MetaKey
+    };
+  }
+
+  // Local-only mode
   const metadata = {
     trackingId,
     fileName,
     format,
     sizeBytes: audioBuffer.length,
     sha256: hash,
-    s3Url: s3Url || null,
+    s3Url: null,
     createdAt: new Date().toISOString(),
-    integrityVerified: true
+    hashCalculated: true
   };
 
-  const metadataPath = filePath + '.json';
-  fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
+  const metadataPath = `${filePath}.json`;
 
-  // Also push metadata JSON to S3
-  const s3MetaKey = `evidence/${trackingId}/${fileName}.json`;
-  await uploadToS3(s3MetaKey, JSON.stringify(metadata, null, 2), 'application/json');
+  fs.writeFileSync(
+    metadataPath,
+    JSON.stringify(metadata, null, 2)
+  );
 
-  console.log(`[EvidenceRecorder] ✅ Evidence saved: ${fileName} (${(audioBuffer.length / 1024).toFixed(1)} KB)`);
-  return { filePath, metadataPath, hash, fileName, s3Url };
+  console.log(
+    `[EvidenceRecorder] ✅ Evidence saved locally: ${fileName}`
+  );
+
+  return {
+    filePath,
+    metadataPath,
+    hash,
+    fileName,
+    s3Url: null
+  };
 }
 
 /**

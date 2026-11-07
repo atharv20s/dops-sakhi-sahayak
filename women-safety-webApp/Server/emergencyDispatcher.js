@@ -572,7 +572,7 @@ async function dispatchFullEmergency(io, alertData) {
 }
 
 // Cleanup old dispatch records every 5 minutes
-setInterval(() => {
+const cleanupTimer = setInterval(() => {
   const now = Date.now();
   for (const [id, time] of dispatchedAlerts) {
     if (now - time > 300000) {
@@ -580,6 +580,7 @@ setInterval(() => {
     }
   }
 }, 300000);
+if (cleanupTimer.unref) cleanupTimer.unref();
 
 module.exports = {
   dispatchEmail,

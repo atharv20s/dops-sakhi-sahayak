@@ -392,15 +392,50 @@ router.post('/transcribe', upload.single('audio'), async (req, res) => {
 });
 
 // ── Evidence Upload ──
-router.post('/upload-evidence', upload.single('evidence'), (req, res) => {
+router.post('/upload-evidence', upload.single('evidence'), async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: 'No evidence file provided' });
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No evidence file provided'
+      });
+    }
+
     const trackingId = req.body.trackingId || 'UNKNOWN';
-    const result = saveEvidence(trackingId, req.file.buffer, 'webm');
-    res.json({ success: true, ...result });
+
+    // Validate client input before writing any files.
+    if (
+      typeof trackingId !== 'string' ||
+      !/^[a-zA-Z0-9_-]{1,100}$/.test(trackingId)
+    ) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid tracking ID'
+      });
+    }
+
+    const result = await saveEvidence(
+      trackingId,
+      req.file.buffer,
+      'webm'
+    );
+
+    if (process.env.S3_EVIDENCE_BUCKET && !result.s3Url) {
+      return res.status(502).json({
+        success: false,
+        error: 'Evidence could not be uploaded to S3'
+      });
+    }
+
+    return res.json({ success: true, ...result });
+
   } catch (err) {
     console.error('[Evidence Upload] Error:', err.message);
-    res.status(500).json({ success: false, error: err.message });
+
+    return res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
@@ -766,19 +801,24 @@ setupWebRTCSignaling(io);
 // ═══════════════════════════════════════════════════════════════
 //  START SERVER
 // ═══════════════════════════════════════════════════════════════
-const PORT = 5001;
-server.listen(PORT, () => {
-  console.log('\n═══════════════════════════════════════════════════════════════');
-  console.log('  🛡️  SAKHI SAHAYAK — Full Stack Server (LangGraph Edition)');
-  console.log('═══════════════════════════════════════════════════════════════');
-  console.log(`  📡  Port          : ${PORT}`);
-  console.log(`  🎤  Sarvam AI STT : ${process.env.SARVAM_API_KEY ? '✅ Configured (Hindi/Marathi/English)' : '❌ Missing SARVAM_API_KEY'}`);
-  console.log(`  🤖  OpenRouter LLM: ${process.env.OPENROUTER_API_KEY ? '✅ Configured (GPT-4o-mini)' : '❌ Missing OPENROUTER_API_KEY'}`);
-  console.log(`  📧  Resend Email  : ${process.env.RESEND_API ? `✅ Configured → ${EMERGENCY_EMAIL}` : '❌ Missing RESEND_API'}`);
-  console.log(`  📱  Fast2SMS      : ${process.env.FAST2SMS_API_KEY ? `✅ Configured → +91 ${EMERGENCY_PHONE}` : '⚠️ Not set (email bridge fallback)'}`);
-  console.log(`  🚔  Police Dashboard : http://localhost:${PORT}/police-dashboard`);
-  console.log(`  📦  Evidence Dir  : ${EVIDENCE_DIR}`);
-  console.log('  ⚡  LangGraph States: IDLE→MONITORING→THREAT_DETECTED→');
-  console.log('      INTERCEPT_COUNTDOWN→EMERGENCY_PROTOCOL→RECORDING→RESOLVED');
-  console.log('═══════════════════════════════════════════════════════════════\n');
-});
+if (require.main === module) {
+  const PORT = process.env.PORT || 5001;
+
+  server.listen(PORT, () => {
+    console.log('\n═══════════════════════════════════════════════════════════════');
+    console.log('  🛡️  SAKHI SAHAYAK — Full Stack Server (LangGraph Edition)');
+    console.log('═══════════════════════════════════════════════════════════════');
+    console.log(`  📡  Port          : ${PORT}`);
+    console.log(`  🎤  Sarvam AI STT : ${process.env.SARVAM_API_KEY ? '✅ Configured (Hindi/Marathi/English)' : '❌ Missing SARVAM_API_KEY'}`);
+    console.log(`  🤖  OpenRouter LLM: ${process.env.OPENROUTER_API_KEY ? '✅ Configured (GPT-4o-mini)' : '❌ Missing OPENROUTER_API_KEY'}`);
+    console.log(`  📧  Resend Email  : ${process.env.RESEND_API ? `✅ Configured → ${EMERGENCY_EMAIL}` : '❌ Missing RESEND_API'}`);
+    console.log(`  📱  Fast2SMS      : ${process.env.FAST2SMS_API_KEY ? `✅ Configured → +91 ${EMERGENCY_PHONE}` : '⚠️ Not set (email bridge fallback)'}`);
+    console.log(`  🚔  Police Dashboard : http://localhost:${PORT}/police-dashboard`);
+    console.log(`  📦  Evidence Dir  : ${EVIDENCE_DIR}`);
+    console.log('  ⚡  LangGraph States: IDLE→MONITORING→THREAT_DETECTED→');
+    console.log('      INTERCEPT_COUNTDOWN→EMERGENCY_PROTOCOL→RECORDING→RESOLVED');
+    console.log('═══════════════════════════════════════════════════════════════\n');
+  });
+}
+
+module.exports = { app, server, io };
