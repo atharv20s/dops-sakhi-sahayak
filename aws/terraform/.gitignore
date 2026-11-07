@@ -1,0 +1,13 @@
+# Local .terraform cache
+.terraform/
+
+# Terraform state files (Strictly never commit state or secrets)
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfplan
+tfplan
+
+# Crash log files
+crash.log
+crash.*.log

@@ -28,8 +28,14 @@ women-safety-webApp/Client/dist/
 Thumbs.db
 .vscode/
 .idea/
+dops-sakhi-sahayak
+*.backup
+tfplan
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
+
+# Historical AWS task definition backups
+*.revision1-backup

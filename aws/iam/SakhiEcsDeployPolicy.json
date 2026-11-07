@@ -1,0 +1,48 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "RegisterOnlySakhiTaskDefinition",
+      "Effect": "Allow",
+      "Action": "ecs:RegisterTaskDefinition",
+      "Resource": "arn:aws:ecs:ap-south-1:758371668629:task-definition/sakhi-backend-task:*"
+    },
+    {
+      "Sid": "DescribeTaskDefinitions",
+      "Effect": "Allow",
+      "Action": "ecs:DescribeTaskDefinition",
+      "Resource": "*"
+    },
+    {
+      "Sid": "DescribeOnlySakhiCluster",
+      "Effect": "Allow",
+      "Action": "ecs:DescribeClusters",
+      "Resource": "arn:aws:ecs:ap-south-1:758371668629:cluster/sakhi-production-cluster"
+    },
+    {
+      "Sid": "ListServicesOnlyForSakhiCluster",
+      "Effect": "Allow",
+      "Action": "ecs:ListServices",
+      "Resource": "*",
+      "Condition": {
+        "ArnEquals": {
+          "ecs:cluster": "arn:aws:ecs:ap-south-1:758371668629:cluster/sakhi-production-cluster"
+        }
+      }
+    },
+    {
+      "Sid": "PassOnlySakhiTaskRoles",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": [
+        "arn:aws:iam::758371668629:role/SakhiEcsTaskExecutionRole",
+        "arn:aws:iam::758371668629:role/SakhiEcsTaskRole"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
+    }
+  ]
+}
