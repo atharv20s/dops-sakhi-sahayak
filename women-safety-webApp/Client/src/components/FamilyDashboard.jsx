@@ -2,8 +2,9 @@ import { useState, useEffect } from 'react';
 import { io } from 'socket.io-client';
 import { ShieldCheck, HeartPulse } from 'lucide-react';
 import SarthiMap from './SarthiMap';
+import { API_ORIGIN } from '../config';
 
-const socket = io('http://localhost:5001');
+const socket = io(API_ORIGIN);
 
 export default function FamilyDashboard() {
   const [trackedUsers, setTrackedUsers] = useState({});

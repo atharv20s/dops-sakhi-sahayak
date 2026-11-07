@@ -1,7 +1,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { io } from 'socket.io-client';
+import { API_ORIGIN } from '../config';
 
-export const socket = io('http://localhost:5001');
+export const socket = io(API_ORIGIN);
 
 // Haversine formula to calculate distance in meters
 function getDistance(lat1, lon1, lat2, lon2) {

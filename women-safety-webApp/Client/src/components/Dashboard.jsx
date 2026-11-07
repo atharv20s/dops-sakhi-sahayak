@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
+import { API_BASE } from '../config';
 import { ShieldAlert, MapPin, Navigation, AlertOctagon, HeartPulse, LocateFixed, Mic, MicOff, AudioLines } from 'lucide-react';
 import SarthiMap from './SarthiMap';
 import { useTracker, socket } from '../hooks/useTracker';
@@ -56,7 +57,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     // Fetch All Safety Data
-    axios.get('http://localhost:5001/api/safety-data')
+    axios.get(`${API_BASE}/safety-data`)
       .then(res => {
         setSafetyData(res.data);
         setDangerZones(res.data.danger_zones || []);
@@ -66,7 +67,7 @@ export default function Dashboard() {
 
   useEffect(() => {
     if (location.lat && location.lng) {
-      axios.get(`http://localhost:5001/api/nearest?lat=${location.lat}&lng=${location.lng}`)
+      axios.get(`${API_BASE}/nearest?lat=${location.lat}&lng=${location.lng}`)
         .then(res => setNearestInfo(res.data))
         .catch(err => console.error(err));
     }
@@ -134,7 +135,7 @@ export default function Dashboard() {
         formData.append('audio', audioBlob, 'recording.webm');
 
         try {
-          const resp = await fetch('http://localhost:5001/api/transcribe', {
+          const resp = await fetch(`${API_BASE}/transcribe`, {
             method: 'POST',
             body: formData
           });

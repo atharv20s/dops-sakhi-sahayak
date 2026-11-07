@@ -1,76 +1,98 @@
-name: Sakhi Sahayak - AWS CI/CD
+name: Sakhi Sahayak - CI, ECR and Render CD
 
 on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
-    inputs:
-      deployment_mode:
-        description: "Choose the workflow execution mode"
-        required: true
-        type: choice
-        default: publish-only
-        options:
-          - publish-only
-          - prepare-ecs
 
 concurrency:
-  group: sakhi-cicd-${{ github.ref }}
+  group: sakhi-render-production
   cancel-in-progress: false
 
 env:
   AWS_REGION: ap-south-1
   AWS_ACCOUNT_ID: "758371668629"
   ECR_SERVER_REPO: sakhi-server
-  ECS_CLUSTER: sakhi-production-cluster
-  ECS_TASK_FAMILY: sakhi-backend-task
+  ECR_IMAGE_URI: 758371668629.dkr.ecr.ap-south-1.amazonaws.com/sakhi-server
 
 jobs:
-  build-and-publish:
-    name: Test, Build and Publish to ECR
+  verify:
+    name: Test, Build Frontend and Validate Docker
     runs-on: ubuntu-latest
-
-    if: github.ref == 'refs/heads/main'
-
     permissions:
       contents: read
-      id-token: write
-
-    outputs:
-      image_uri: ${{ steps.image.outputs.image_uri }}
-      image_digest: ${{ steps.build.outputs.digest }}
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
-          cache-dependency-path: women-safety-webApp/Server/package-lock.json
+          cache-dependency-path: |
+            women-safety-webApp/Server/package-lock.json
+            women-safety-webApp/Client/package-lock.json
 
-      - name: Install Backend Dependencies and Run Tests
+      - name: Install Backend Dependencies and Run All Tests
         working-directory: women-safety-webApp/Server
         run: |
           npm ci
           node --check index.js
-          node --check evidenceRecorder.js
-          node --test tests/health.test.js
-          node --test tests/evidenceRecorder.test.js
-          node --test tests/evidenceUpload.integration.test.js
+          node --test tests/*.test.js
 
-      - name: Build Frontend
+      - name: Build Frontend for Production
         working-directory: women-safety-webApp/Client
+        env:
+          VITE_API_BASE_URL: https://sakhi-backend.example.invalid/api
+          VITE_SOCKET_URL: https://sakhi-backend.example.invalid
         run: |
           npm ci
           npm run build
 
-      - name: Configure AWS Credentials via OIDC
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Validate Render-compatible Linux AMD64 Image
+        working-directory: women-safety-webApp/Server
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag sakhi-backend:ci .
+
+      - name: Verify Docker HEALTHCHECK Metadata
+        run: |
+          docker inspect sakhi-backend:ci \
+            --format '{{json .Config.Healthcheck}}' | tee healthcheck.json
+          grep -q '127.0.0.1:5001/health' healthcheck.json
+
+  publish-ecr:
+    name: Publish Immutable Image to Amazon ECR
+    runs-on: ubuntu-latest
+    needs: verify
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image_uri: ${{ steps.image.outputs.image_uri }}
+      image_digest: ${{ steps.build.outputs.digest }}
+      immutable_image: ${{ steps.immutable.outputs.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via GitHub OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::758371668629:role/GitHubActionsSakhiRole
           aws-region: ${{ env.AWS_REGION }}
-          role-session-name: sakhi-cicd-${{ github.run_id }}
+          role-session-name: sakhi-ecr-${{ github.run_id }}
 
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
@@ -80,97 +102,150 @@ jobs:
 
       - name: Define Image URI
         id: image
-        run: |
-          echo "image_uri=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_SERVER_REPO}" >> "$GITHUB_OUTPUT"
+        run: echo "image_uri=${ECR_IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
-      - name: Build and Push Immutable Image
+      - name: Build and Push SHA-tagged Image
         id: build
         uses: docker/build-push-action@v6
         with:
           context: ./women-safety-webApp/Server
+          platforms: linux/amd64
           push: true
           tags: |
-            ${{ steps.image.outputs.image_uri }}:${{ github.sha }}
-            ${{ steps.image.outputs.image_uri }}:latest
+            ${{ env.ECR_IMAGE_URI }}:${{ github.sha }}
+            ${{ env.ECR_IMAGE_URI }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Display Published Image
+      - name: Record Immutable Image Reference
+        id: immutable
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.image_uri }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          echo "Image URI: ${{ steps.image.outputs.image_uri }}"
-          echo "Image digest: ${{ steps.build.outputs.digest }}"
-          echo "Immutable image:"
-          echo "${{ steps.image.outputs.image_uri }}@${{ steps.build.outputs.digest }}"
+          IMAGE="${IMAGE_URI}@${IMAGE_DIGEST}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Published immutable image: ${IMAGE}"
 
-  prepare-ecs:
-    name: Production Approval and Deployment Preparation
+  deploy-render:
+    name: Deploy Exact ECR Digest to Render
     runs-on: ubuntu-latest
-
-    needs: build-and-publish
-
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      inputs.deployment_mode == 'prepare-ecs'
-
+    needs: publish-ecr
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    timeout-minutes: 30
     environment:
       name: production
-
     permissions:
       contents: read
+      id-token: write
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_SERVICE_ID: ${{ secrets.RENDER_SERVICE_ID }}
+      RENDER_REGISTRY_CREDENTIAL_ID: ${{ secrets.RENDER_REGISTRY_CREDENTIAL_ID }}
+      RENDER_SERVICE_URL: ${{ vars.RENDER_SERVICE_URL }}
+      IMAGE_URI: ${{ needs.publish-ecr.outputs.image_uri }}
+      IMAGE_DIGEST: ${{ needs.publish-ecr.outputs.image_digest }}
 
     steps:
-      - name: Create Deployment Manifest
-        env:
-          IMAGE_URI: ${{ needs.build-and-publish.outputs.image_uri }}
-          IMAGE_DIGEST: ${{ needs.build-and-publish.outputs.image_digest }}
-          COMMIT_SHA: ${{ github.sha }}
-          RUN_ID: ${{ github.run_id }}
+      - name: Validate Render Environment Configuration
         run: |
-          mkdir -p deployment
+          : "${RENDER_API_KEY:?Missing production secret RENDER_API_KEY}"
+          : "${RENDER_SERVICE_ID:?Missing production secret RENDER_SERVICE_ID}"
+          : "${RENDER_REGISTRY_CREDENTIAL_ID:?Missing production secret RENDER_REGISTRY_CREDENTIAL_ID}"
+          : "${RENDER_SERVICE_URL:?Missing production environment variable RENDER_SERVICE_URL}"
 
-          IMAGE="${IMAGE_URI}@${IMAGE_DIGEST}"
-
-          python3 - <<'PY'
-          import json
-          import os
-
-          manifest = {
-              "project": "sakhi-sahayak",
-              "commit": os.environ["COMMIT_SHA"],
-              "workflow_run_id": os.environ["RUN_ID"],
-              "aws_region": "ap-south-1",
-              "ecr_image": os.environ["IMAGE_URI"],
-              "image_digest": os.environ["IMAGE_DIGEST"],
-              "immutable_image": (
-                  os.environ["IMAGE_URI"] + "@" + os.environ["IMAGE_DIGEST"]
-              ),
-              "ecs_cluster": "sakhi-production-cluster",
-              "ecs_task_family": "sakhi-backend-task",
-              "ecs_service": None,
-              "task_definition_registration": "not_performed",
-              "ecs_service_deployment": "not_performed",
-              "compute_started": False,
-              "terraform_remains_source_of_truth": True
-          }
-
-          with open("deployment/deployment-manifest.json", "w") as f:
-              json.dump(manifest, f, indent=2)
-              f.write("\n")
-          PY
-
-      - name: Upload Deployment Manifest
-        uses: actions/upload-artifact@v4
+      - name: Configure AWS Credentials via GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          name: sakhi-deployment-manifest-${{ github.run_id }}
-          path: deployment/deployment-manifest.json
-          if-no-files-found: error
-          retention-days: 30
+          role-to-assume: arn:aws:iam::758371668629:role/GitHubActionsSakhiRole
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: sakhi-render-${{ github.run_id }}
 
-      - name: Explain Deployment Boundary
+      - name: Refresh Render AWS ECR Registry Credential
+        env:
+          AWS_ACCOUNT_ID: ${{ env.AWS_ACCOUNT_ID }}
+          AWS_REGION: ${{ env.AWS_REGION }}
         run: |
-          echo "Deployment preparation completed."
-          echo "The immutable image digest is recorded in the artifact."
-          echo "No ECS task definition was registered."
-          echo "No ECS service was created or updated."
-          echo "No ECS task was launched."
-          echo "Terraform remains the infrastructure source of truth."
+          set -euo pipefail
+          ECR_PASSWORD="$(aws ecr get-login-password --region "$AWS_REGION")"
+          PAYLOAD="$(jq -n \
+            --arg name "Sakhi Sahayak ECR" \
+            --arg username "$AWS_ACCOUNT_ID" \
+            --arg authToken "$ECR_PASSWORD" \
+            '{registry:"AWS_ECR", name:$name, username:$username, authToken:$authToken}')"
+          curl --fail-with-body --silent --show-error \
+            --request PATCH \
+            "https://api.render.com/v1/registrycredentials/$RENDER_REGISTRY_CREDENTIAL_ID" \
+            --header "Authorization: Bearer $RENDER_API_KEY" \
+            --header "Content-Type: application/json" \
+            --data "$PAYLOAD" \
+            --output "$RUNNER_TEMP/render-credential-response.json"
+          echo "Render ECR pull credential refreshed."
+
+      - name: Trigger Render Deployment Using the Published Digest
+        id: trigger
+        run: |
+          set -euo pipefail
+          IMAGE_REF="${IMAGE_URI}@${IMAGE_DIGEST}"
+          PAYLOAD="$(jq -n --arg imageUrl "$IMAGE_REF" '{imageUrl:$imageUrl}')"
+          HTTP_CODE="$(curl --silent --show-error \
+            --output "$RUNNER_TEMP/render-deploy.json" \
+            --write-out '%{http_code}' \
+            --request POST \
+            "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys" \
+            --header "Authorization: Bearer $RENDER_API_KEY" \
+            --header "Content-Type: application/json" \
+            --data "$PAYLOAD")"
+          if [[ "$HTTP_CODE" != "201" ]]; then
+            echo "Render deploy request returned HTTP $HTTP_CODE"
+            cat "$RUNNER_TEMP/render-deploy.json"
+            exit 1
+          fi
+          DEPLOY_ID="$(jq -r '.id // empty' "$RUNNER_TEMP/render-deploy.json")"
+          test -n "$DEPLOY_ID" || { echo "Render did not return a deploy ID"; exit 1; }
+          echo "deploy_id=$DEPLOY_ID" >> "$GITHUB_OUTPUT"
+          echo "Render accepted deployment $DEPLOY_ID for $IMAGE_REF"
+
+      - name: Wait for Render Deployment to Become Live
+        env:
+          DEPLOY_ID: ${{ steps.trigger.outputs.deploy_id }}
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 60); do
+            curl --fail-with-body --silent --show-error \
+              "https://api.render.com/v1/services/$RENDER_SERVICE_ID/deploys/$DEPLOY_ID" \
+              --header "Authorization: Bearer $RENDER_API_KEY" \
+              --output "$RUNNER_TEMP/render-status.json"
+            STATUS="$(jq -r '.status // empty' "$RUNNER_TEMP/render-status.json")"
+            echo "Render deployment status: ${STATUS:-unknown} (check $attempt/60)"
+            if [[ "$STATUS" == "live" ]]; then
+              exit 0
+            fi
+            case "$STATUS" in
+              build_failed|update_failed|pre_deploy_failed|canceled|deactivated)
+                cat "$RUNNER_TEMP/render-status.json"
+                exit 1
+                ;;
+            esac
+            sleep 15
+          done
+          echo "Timed out waiting for Render deployment to become live."
+          cat "$RUNNER_TEMP/render-status.json"
+          exit 1
+
+      - name: Verify Public Backend Health Endpoint
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if BODY="$(curl --fail --silent --show-error "$RENDER_SERVICE_URL/health")"; then
+              if echo "$BODY" | jq -e '.status == "healthy" and .service == "sakhi-backend"' >/dev/null; then
+                echo "Render backend health check passed."
+                echo "$BODY" | jq .
+                exit 0
+              fi
+            fi
+            echo "Health endpoint not ready yet (check $attempt/20)."
+            sleep 10
+          done
+          echo "Render deployment is live but the application health endpoint failed."
+          exit 1
