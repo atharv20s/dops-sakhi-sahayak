@@ -55,6 +55,7 @@ jobs:
           npm ci
           node --check index.js
           node --check evidenceRecorder.js
+          node --test tests/health.test.js
           node --test tests/evidenceRecorder.test.js
           node --test tests/evidenceUpload.integration.test.js
 

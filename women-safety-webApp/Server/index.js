@@ -49,6 +49,19 @@ if (process.env.REDIS_URL) {
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Lightweight health check — intentionally independent of database connectivity.
+const healthHandler = (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    service: 'sakhi-backend',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString()
+  });
+};
+
+// Direct health endpoint for Docker and infrastructure monitoring.
+app.get('/health', healthHandler);
+
 // Serve evidence files statically
 app.use('/evidence', express.static(EVIDENCE_DIR));
 
@@ -560,6 +573,9 @@ router.post('/safety-reports', (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+// API-level health endpoint.
+router.get('/health', healthHandler);
 
 app.use('/api', router);
 

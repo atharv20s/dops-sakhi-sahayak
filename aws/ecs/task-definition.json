@@ -1,0 +1,55 @@
+{
+  "family": "sakhi-backend-task",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "executionRoleArn": "arn:aws:iam::758371668629:role/SakhiEcsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::758371668629:role/SakhiEcsTaskRole",
+  "runtimePlatform": {
+    "operatingSystemFamily": "LINUX",
+    "cpuArchitecture": "X86_64"
+  },
+  "containerDefinitions": [
+    {
+      "name": "sakhi-server",
+      "image": "758371668629.dkr.ecr.ap-south-1.amazonaws.com/sakhi-server@sha256:8ad1800599110e2e57b2e1de15844053f17018c8e63d699326b7445b3186ce7a",
+      "essential": true,
+      "portMappings": [
+        {
+          "name": "sakhi-server-5001",
+          "containerPort": 5001,
+          "hostPort": 5001,
+          "protocol": "tcp",
+          "appProtocol": "http"
+        }
+      ],
+      "environment": [
+        {
+          "name": "NODE_ENV",
+          "value": "production"
+        },
+        {
+          "name": "PORT",
+          "value": "5001"
+        },
+        {
+          "name": "S3_EVIDENCE_BUCKET",
+          "value": "sakhi-evidence-758371668629"
+        },
+        {
+          "name": "AWS_REGION",
+          "value": "ap-south-1"
+        }
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/sakhi-backend",
+          "awslogs-region": "ap-south-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      }
+    }
+  ]
+}
