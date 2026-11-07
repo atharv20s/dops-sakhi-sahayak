@@ -11,6 +11,9 @@ RUN npm ci --omit=dev
 
 COPY . .
 
+# Generate Prisma Client
+RUN npx prisma generate
+
 ENV PORT=5001
 
 EXPOSE 5001
