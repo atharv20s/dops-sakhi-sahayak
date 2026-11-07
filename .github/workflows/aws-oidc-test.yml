@@ -1,0 +1,39 @@
+name: Sakhi Sahayak - AWS OIDC Test
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  aws-authentication:
+    name: Verify AWS OIDC Authentication
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::758371668629:role/GitHubActionsSakhiRole
+          aws-region: ap-south-1
+          role-session-name: sakhi-github-${{ github.run_id }}
+
+      - name: Verify AWS Identity
+        run: |
+          echo "Checking assumed AWS identity..."
+          aws sts get-caller-identity
+
+      - name: Verify ECR Authentication Permission
+        run: |
+          echo "Checking ECR authorization..."
+          aws ecr get-login-password --region ap-south-1 > /dev/null
+          echo "ECR authentication successful."
