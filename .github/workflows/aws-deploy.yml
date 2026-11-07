@@ -33,10 +33,14 @@ jobs:
           cache: 'npm'
           cache-dependency-path: women-safety-webApp/Server/package-lock.json
 
-      - name: Verify Backend Builds Cleanly
+      - name: Run Backend Unit & Integration Tests
         run: |
           cd women-safety-webApp/Server
           npm ci
+          node --check index.js
+          node --check evidenceRecorder.js
+          node --test tests/evidenceRecorder.test.js
+          node --test tests/evidenceUpload.integration.test.js
 
       - name: Build Frontend Assets
         run: |
