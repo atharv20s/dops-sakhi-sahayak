@@ -49,7 +49,9 @@ Add these **repository variables** under Settings → Secrets and variables → 
 | `RENDER_SERVICE_URL` | Public service origin, e.g. `https://your-service.onrender.com` (no trailing slash) |
 | `RENDER_DEPLOY_ENABLED` | Set to `true` only after the image-backed service, registry credential, and secrets are configured |
 
-Until `RENDER_DEPLOY_ENABLED=true`, CI and ECR publishing still run but the Render deploy and credential-refresh jobs are skipped.\n\nDo not commit API keys, deploy hooks, ECR passwords, or application secrets. Do not paste credentials into chat or workflow files.
+Until `RENDER_DEPLOY_ENABLED=true`, CI and ECR publishing still run but the Render deploy and credential-refresh jobs are skipped.
+
+Do not commit API keys, deploy hooks, ECR passwords, or application secrets. Do not paste credentials into chat or workflow files.
 
 The workflow uses the existing GitHub OIDC role `GitHubActionsSakhiRole`. It obtains a fresh ECR password at runtime; no long-lived AWS access keys are stored in GitHub.
 
