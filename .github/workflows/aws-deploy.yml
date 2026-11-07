@@ -1,23 +1,26 @@
-name: AWS Production CI/CD Pipeline
+name: Sakhi Sahayak - AWS ECR Publish (Manual)
 
 on:
-  push:
-    branches: [ "main" ]
+  # Retain only manual execution; disable automated push triggers
+  workflow_dispatch:
+
+concurrency:
+  group: sakhi-ecr-publish
+  cancel-in-progress: false
 
 permissions:
   id-token: write
   contents: read
 
 env:
-  AWS_REGION: ap-south-1 # Mumbai
+  AWS_REGION: ap-south-1
   ECR_SERVER_REPO: sakhi-server
-  ECS_CLUSTER: sakhi-production-cluster
-  ECS_SERVICE: sakhi-backend-service
-  S3_CLIENT_BUCKET: ${{ secrets.S3_CLIENT_BUCKET }}
 
 jobs:
-  build-and-deploy:
+  build-and-publish:
+    name: Build & Publish to Amazon ECR
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
 
     steps:
       - name: Checkout Code
@@ -26,7 +29,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
           cache: 'npm'
           cache-dependency-path: women-safety-webApp/Server/package-lock.json
 
@@ -41,16 +44,20 @@ jobs:
           npm ci
           npm run build
 
-      - name: Configure AWS Credentials (OIDC or Secret Keys)
+      # Authenticate via proven AWS IAM OIDC (Zero permanent secrets)
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::758371668629:role/GitHubActionsSakhiRole
           aws-region: ${{ env.AWS_REGION }}
+          role-session-name: sakhi-deploy-${{ github.run_id }}
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build, Tag, and Push Backend Docker Image
         env:
@@ -61,21 +68,5 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_SERVER_REPO:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_SERVER_REPO:latest
 
-      - name: Deploy Backend Container to AWS ECS Fargate
-        run: |
-          aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ env.ECS_SERVICE }} \
-            --force-new-deployment
-
-      - name: Deploy Frontend to S3 and Invalidate CloudFront CDN
-        if: env.S3_CLIENT_BUCKET != ''
-        env:
-          S3_CLIENT_BUCKET: ${{ secrets.S3_CLIENT_BUCKET }}
-          CLOUDFRONT_DIST_ID: ${{ secrets.CLOUDFRONT_DIST_ID }}
-        run: |
-          aws s3 sync ./women-safety-webApp/Client/dist s3://$S3_CLIENT_BUCKET --delete
-          if [ -n "$CLOUDFRONT_DIST_ID" ]; then
-            aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DIST_ID --paths "/*"
-          fi
-
+      # Note: ECS Fargate and S3/CloudFront deployments retired.
+      # Live frontend hosting is on Vercel; live backend hosting is on Render.
