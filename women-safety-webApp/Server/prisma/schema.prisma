@@ -1,0 +1,94 @@
+// ==============================================================================
+//  Sakhi Sahayak — Prisma Schema for PostgreSQL
+// ==============================================================================
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ── 1. USERS TABLE ──
+// Stores registered users with bcrypt password hash and emergency contact details.
+model User {
+  id                    String            @id @default(uuid()) @db.Uuid
+  phone                 String            @unique @db.VarChar(20)
+  name                  String            @db.VarChar(100)
+  passwordHash          String            @map("password_hash") @db.VarChar(255)
+  emergencyContactName  String?           @map("emergency_contact_name") @db.VarChar(100)
+  emergencyContactPhone String?           @map("emergency_contact_phone") @db.VarChar(20)
+  createdAt             DateTime          @default(now()) @map("created_at")
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+
+  evidenceObjects       EvidenceObject[]
+
+  @@index([phone])
+  @@map("users")
+}
+
+// ── 2. POLICE STATIONS TABLE ──
+// Seeded from safety_data.json. Preserves phone as a native PostgreSQL String[] array.
+model PoliceStation {
+  id              String   @id @default(uuid()) @db.Uuid
+  name            String   @db.VarChar(150)
+  lat             Float    @db.DoublePrecision
+  lng             Float    @db.DoublePrecision
+  phone           String[] @default([])
+  email           String   @default("") @db.VarChar(100)
+  zone            String   @default("") @db.VarChar(50)
+  officerInCharge String   @default("") @map("officer_in_charge") @db.VarChar(100)
+  type            String   @default("city") @db.VarChar(30)
+  category        String   @default("station") @db.VarChar(30)
+  address         String   @default("") @db.VarChar(255)
+  description     String   @default("") @db.Text
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@index([lat, lng])
+  @@index([category])
+  @@map("police_stations")
+}
+
+// ── 3. SAFETY REPORTS TABLE ──
+// Preserves legacy IDs ("demo-1", etc.) and UUIDs for new reports.
+// Location Privacy: lat/lng must be null when shareExact is false.
+model SafetyReport {
+  id          String   @id @default(uuid())
+  category    String   @db.VarChar(50)
+  locality    String   @db.VarChar(150)
+  description String   @db.Text
+  lat         Float?   @db.DoublePrecision
+  lng         Float?   @db.DoublePrecision
+  shareExact  Boolean  @default(false) @map("share_exact")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@index([category])
+  @@index([createdAt])
+  @@map("safety_reports")
+}
+
+// ── 4. EVIDENCE OBJECTS TABLE ──
+// Metadata for S3-persisted evidence audio and emergency recordings.
+model EvidenceObject {
+  id         String    @id @default(uuid()) @db.Uuid
+  trackingId String    @map("tracking_id") @db.VarChar(64)
+  s3Key      String    @unique @map("s3_key") @db.VarChar(500)
+  s3Bucket   String    @map("s3_bucket") @db.VarChar(100)
+  fileName   String    @map("file_name") @db.VarChar(255)
+  fileFormat String    @map("file_format") @db.VarChar(20)
+  sha256     String    @db.VarChar(64)
+  sizeBytes  Int       @map("size_bytes")
+  mimeType   String    @map("mime_type") @db.VarChar(50)
+  userId     String?   @map("user_id") @db.Uuid
+  user       User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  metadata   Json?     @db.JsonB
+  createdAt  DateTime  @default(now()) @map("created_at")
+
+  @@index([trackingId])
+  @@index([sha256])
+  @@map("evidence_objects")
+}
