@@ -139,8 +139,12 @@ const readyHandler = async (req, res) => {
 app.get('/health', healthHandler);
 app.get('/ready', readyHandler);
 
-// Serve evidence files statically
-app.use('/evidence', express.static(EVIDENCE_DIR));
+// Local evidence downloads are available only in development.
+// Production evidence is served exclusively through authenticated, short-lived
+// S3 presigned URLs after ownership or emergency-capability checks.
+if (process.env.NODE_ENV !== 'production') {
+  app.use('/evidence', express.static(EVIDENCE_DIR));
+}
 
 // Multer config for audio/evidence upload (memory storage)
 const upload = multer({
@@ -1050,9 +1054,17 @@ io.on('connection', (socket) => {
   });
 
   // ── User confirmed safety (stop recording, resolve emergency) ──
-  socket.on('safety-confirmed', () => {
+  socket.on('safety-confirmed', async () => {
     console.log(`[BACKEND] ✅ Safety confirmed by ${socket.id}`);
-    voiceAgent.resolveEmergency(socket.id, io, 'Safety confirmed by user');
+    try {
+      await voiceAgent.resolveEmergency(socket.id, io, 'Safety confirmed by user');
+    } catch (err) {
+      console.error('[BACKEND] ❌ Emergency resolution failed:', err.message);
+      socket.emit('emergency-resolution-error', {
+        success: false,
+        error: 'The emergency could not be fully resolved. Please retry or contact support.'
+      });
+    }
   });
 
   // ── Evidence chunk upload via socket ──
