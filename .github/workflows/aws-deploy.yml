@@ -7,10 +7,9 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Keep pull-request verification independent from main/production deploys.
-# New commits to the same PR supersede its older verification run.
+# PR checks are isolated; production deploy, ECR refresh, and rollback share one lock.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ${{ github.event_name == 'pull_request' && format('sakhi-pr-{0}', github.event.pull_request.number) || (github.ref == 'refs/heads/main' && 'sakhi-render-production') || format('sakhi-ci-{0}', github.ref) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
