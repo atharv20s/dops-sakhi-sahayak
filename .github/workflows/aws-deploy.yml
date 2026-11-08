@@ -7,10 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# PR checks are isolated; production deploy, ECR refresh, and rollback share one lock.
+# PR checks are isolated by ref; main-branch deploys serialize under sakhi-render-production.
 concurrency:
-  group: ${{ github.event_name == 'pull_request' && format('sakhi-pr-{0}', github.event.pull_request.number) || (github.ref == 'refs/heads/main' && 'sakhi-render-production') || format('sakhi-ci-{0}', github.ref) }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.ref_name == 'main' && 'sakhi-render-production' || github.ref }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 env:
   AWS_REGION: ap-south-1
