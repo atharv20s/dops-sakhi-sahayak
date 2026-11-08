@@ -11,7 +11,7 @@ resource "aws_db_subnet_group" "sakhi_postgres" {
 
   name        = "sakhi-${var.environment}-postgres-subnets"
   description = "Default VPC subnets across ap-south-1 Availability Zones for Sakhi PostgreSQL RDS"
-  subnet_ids  = [
+  subnet_ids = [
     aws_default_subnet.subnet_a.id,
     aws_default_subnet.subnet_b.id,
     aws_default_subnet.subnet_c.id
@@ -82,7 +82,7 @@ resource "aws_db_instance" "sakhi_postgres" {
   # Render's Singapore region cannot privately route to the AWS Mumbai VPC.
   # Public reachability is constrained by the CIDR-only SG rules above.
   publicly_accessible = true
-  multi_az             = false
+  multi_az            = false
 
   backup_retention_period   = var.rds_backup_retention_days
   copy_tags_to_snapshot     = true
