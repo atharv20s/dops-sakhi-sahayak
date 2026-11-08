@@ -7,9 +7,11 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# Keep pull-request verification independent from main/production deploys.
+# New commits to the same PR supersede its older verification run.
 concurrency:
-  group: sakhi-render-production
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   AWS_REGION: ap-south-1
