@@ -44,6 +44,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+
+      - name: Format and Validate Terraform (No AWS Access or State)
+        working-directory: aws/terraform
+        run: |
+          terraform fmt -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
