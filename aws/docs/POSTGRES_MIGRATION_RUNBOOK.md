@@ -132,3 +132,43 @@ When Workload Identity is enabled, Render automatically injects `AWS_WEB_IDENTIT
   **~$26.50 / month** (or ~$7.00/month if utilizing AWS credits).
 - **Enterprise Isolation (Render Pro + Dedicated IP + Render Starter + RDS)**:
   **~$55.50 / month**.
+
+---
+
+## 6. Security Architecture & Operational Runbooks
+
+### 6.1 JWT Session Lifecycle & Zero-Downtime Secret Rotation
+- **Strict Production Enforcement**:
+  - `JWT_SECRET` must be set via environment variable with a minimum length of 32 characters.
+  - Startup immediately fails (`FATAL: JWT_SECRET environment variable is missing in production`) if unset or weak.
+  - Constant-time signature comparison (`crypto.timingSafeEqual`) prevents timing oracle attacks.
+- **Zero-Downtime Secret Rotation Runbook**:
+  1. Generate a new 32+ character cryptographically secure secret:
+     ```bash
+     openssl rand -hex 32
+     ```
+  2. Set `JWT_SECRET_PREVIOUS` to the currently active `JWT_SECRET` in Render environment settings.
+  3. Set `JWT_SECRET` to the new secret generated in step 1.
+  4. Deploy the service. Tokens issued under the previous secret remain valid during the transition period.
+  5. Once all legacy sessions have expired (or after 7 days), remove `JWT_SECRET_PREVIOUS`.
+- **Persistent Session Revocation**:
+  - Tokens can be revoked immediately upon logout or compromised account detection (`POST /api/logout`).
+  - Revoked token SHA-256 hashes are stored in the PostgreSQL `revoked_tokens` table until their natural expiry date.
+  - The middleware verifies both signature validity and revocation status on every protected request.
+
+### 6.2 Evidence Access Authorization Matrix
+| Resource | Requester Context | Authorization Check | Result |
+| :--- | :--- | :--- | :--- |
+| **Owned Evidence** | Matching Owner | `req.user.userId === record.userId` | **200 OK / Download URL** |
+| **Owned Evidence** | Different User | `req.user.userId !== record.userId` | **403 Forbidden** |
+| **Owned Evidence** | Anonymous Requester | `!req.user` | **401 Unauthorized** |
+| **Anonymous Emergency Evidence** | Bearer of `x-tracking-secret` | `SHA256(secret) === record.metadata.trackingSecretHash` | **200 OK / Download URL** |
+| **Anonymous Emergency Evidence** | Missing or Invalid Secret | Hash mismatch | **403 Forbidden** |
+| **Socket.IO Evidence Chunk** | Connected Client | Handshake authentication verified; client payload `userId` ignored | **Saved with verified identity** |
+
+### 6.3 Production Database Outage Fail-Closed Behavior
+In production (`NODE_ENV === 'production'`), dynamic data is NEVER written to local disk or JSON:
+- `/ready`: Returns HTTP 503 (`status: unready`, `database: disconnected`) when PostgreSQL is unreachable.
+- `/api/signup` & `/api/login`: Return HTTP 503 when PostgreSQL is unreachable.
+- `/api/safety-reports` (GET & POST): Return HTTP 503 when PostgreSQL is unreachable.
+- `/api/upload-evidence`: Throws and returns HTTP 503/500 if S3 or PostgreSQL metadata persistence fails.

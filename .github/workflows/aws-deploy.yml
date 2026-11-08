@@ -56,6 +56,7 @@ jobs:
         working-directory: women-safety-webApp/Server
         env:
           DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/sakhi_test?schema=public
+          JWT_SECRET: c0ffee-test-session-secret-at-least-32-chars-long!
           NODE_ENV: test
         run: |
           npm ci

@@ -16,6 +16,14 @@ function ensureDir() {
   }
 }
 
+function safeCompare(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
 // Lazy/dynamic clients to avoid eager environment/dotenv initialization issues
 function getS3Client() {
   const bucket = process.env.S3_EVIDENCE_BUCKET;
@@ -67,9 +75,13 @@ async function uploadToS3(key, body, contentType = 'audio/webm') {
 
 /**
  * Save evidence to S3 and record metadata in PostgreSQL.
- * Production strictly requires S3 and PostgreSQL metadata persistence.
+ *
+ * Production Invariants:
+ * - Zero local disk writes (no local evidence directory, no local audio files, no local JSON sidecars).
+ * - S3 audio upload + PostgreSQL metadata are mandatory.
+ * - Local filesystem persistence is strictly for offline/development/test modes.
  */
-async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = null) {
+async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = null, providedSecret = null) {
   if (
     typeof trackingId !== 'string' ||
     !/^[a-zA-Z0-9_-]{1,100}$/.test(trackingId)
@@ -77,27 +89,13 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = n
     throw new Error('Invalid tracking ID');
   }
 
-  ensureDir();
-
-  const timestamp = Date.now();
-  const fileName = `evidence_${trackingId}_${timestamp}.${format}`;
-  const filePath = path.join(EVIDENCE_DIR, fileName);
-
-  // Save local copy for offline/dev tests
-  fs.writeFileSync(filePath, audioBuffer);
-
-  // Calculate SHA-256
-  const hash = crypto
-    .createHash('sha256')
-    .update(audioBuffer)
-    .digest('hex');
-
+  const isProd = process.env.NODE_ENV === 'production';
   const s3Bucket = process.env.S3_EVIDENCE_BUCKET;
   const s3Client = getS3Client();
   const db = getDb();
 
   // In production, strictly require S3 and PostgreSQL
-  if (process.env.NODE_ENV === 'production') {
+  if (isProd) {
     if (!s3Bucket || !s3Client) {
       throw new Error('S3_EVIDENCE_BUCKET is required in production.');
     }
@@ -106,8 +104,32 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = n
     }
   }
 
+  const timestamp = Date.now();
+  const fileName = `evidence_${trackingId}_${timestamp}.${format}`;
+
+  // Calculate SHA-256
+  const hash = crypto
+    .createHash('sha256')
+    .update(audioBuffer)
+    .digest('hex');
+
+  // Handle authorization secret for anonymous emergency sessions
+  let trackingSecret = null;
+  let trackingSecretHash = null;
+
+  if (!userId) {
+    if (providedSecret && typeof providedSecret === 'string' && providedSecret.length >= 16) {
+      trackingSecret = providedSecret;
+    } else {
+      trackingSecret = crypto.randomBytes(24).toString('hex');
+    }
+    trackingSecretHash = crypto.createHash('sha256').update(trackingSecret).digest('hex');
+  }
+
   let s3AudioKey = null;
   let s3MetaKey = null;
+  let filePath = null;
+  let metadataPath = null;
 
   if (s3Client && s3Bucket) {
     s3AudioKey = `evidence/${trackingId}/${fileName}`;
@@ -120,84 +142,52 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = n
       sizeBytes: audioBuffer.length,
       sha256: hash,
       s3Key: s3AudioKey,
+      trackingSecretHash,
       createdAt: new Date().toISOString(),
       hashCalculated: true
     };
 
-    const metadataPath = `${filePath}.json`;
-    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
-
     s3MetaKey = `${s3AudioKey}.json`;
     await uploadToS3(s3MetaKey, JSON.stringify(metadata, null, 2), 'application/json');
 
-    // Persist metadata to PostgreSQL whenever configured — failure MUST fail the upload!
-    let dbRecord = null;
-    if (db && db.isDatabaseConfigured()) {
-      try {
-        dbRecord = await db.prisma.evidenceObject.create({
-          data: {
-            trackingId,
-            s3Key: s3AudioKey,
-            s3Bucket: s3Bucket,
-            fileName,
-            fileFormat: format,
-            sha256: hash,
-            sizeBytes: audioBuffer.length,
-            mimeType: `audio/${format}`,
-            userId: userId || null,
-            metadata: {
-              trackingId,
-              fileName,
-              sizeBytes: audioBuffer.length,
-              sha256: hash,
-              createdAt: new Date().toISOString()
-            }
-          }
-        });
-        console.log(`[EvidenceRecorder] 🗄️ Metadata persisted to PostgreSQL: ${dbRecord.id} (tracking: ${trackingId})`);
-      } catch (err) {
-        console.error(`[EvidenceRecorder] ❌ PostgreSQL metadata write failed for ${trackingId}:`, err.message);
-        throw err;
-      }
+    // In non-production with S3 enabled, optional local copy for inspection
+    if (!isProd) {
+      ensureDir();
+      filePath = path.join(EVIDENCE_DIR, fileName);
+      fs.writeFileSync(filePath, audioBuffer);
+      metadataPath = `${filePath}.json`;
+      fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
     }
+  } else {
+    // Non-production local storage mode
+    ensureDir();
+    filePath = path.join(EVIDENCE_DIR, fileName);
+    fs.writeFileSync(filePath, audioBuffer);
 
-    return {
-      evidenceId: dbRecord ? dbRecord.id : null,
-      filePath,
-      metadataPath,
-      hash,
-      sha256: hash,
-      fileName,
+    const metadata = {
       trackingId,
-      s3Key: s3AudioKey,
-      s3Bucket,
+      fileName,
       format,
-      sizeBytes: audioBuffer.length
+      sizeBytes: audioBuffer.length,
+      sha256: hash,
+      s3Url: null,
+      trackingSecretHash,
+      createdAt: new Date().toISOString(),
+      hashCalculated: true
     };
+    metadataPath = `${filePath}.json`;
+    fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
   }
 
-  // Local-only mode
-  const metadata = {
-    trackingId,
-    fileName,
-    format,
-    sizeBytes: audioBuffer.length,
-    sha256: hash,
-    s3Url: null,
-    createdAt: new Date().toISOString(),
-    hashCalculated: true
-  };
-  const metadataPath = `${filePath}.json`;
-  fs.writeFileSync(metadataPath, JSON.stringify(metadata, null, 2));
-
+  // Persist metadata to PostgreSQL whenever configured — failure MUST fail the upload!
   let dbRecord = null;
   if (db && db.isDatabaseConfigured()) {
     try {
       dbRecord = await db.prisma.evidenceObject.create({
         data: {
           trackingId,
-          s3Key: `local/${trackingId}/${fileName}`,
-          s3Bucket: 'local-filesystem',
+          s3Key: s3AudioKey || `local/${trackingId}/${fileName}`,
+          s3Bucket: s3Bucket || 'local-filesystem',
           fileName,
           fileFormat: format,
           sha256: hash,
@@ -209,6 +199,7 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = n
             fileName,
             sizeBytes: audioBuffer.length,
             sha256: hash,
+            trackingSecretHash,
             createdAt: new Date().toISOString()
           }
         }
@@ -228,8 +219,9 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = n
     sha256: hash,
     fileName,
     trackingId,
-    s3Key: null,
-    s3Bucket: null,
+    trackingSecret,
+    s3Key: s3AudioKey,
+    s3Bucket: s3Bucket || null,
     s3Url: null,
     format,
     sizeBytes: audioBuffer.length
@@ -237,48 +229,77 @@ async function saveEvidence(trackingId, audioBuffer, format = 'webm', userId = n
 }
 
 /**
- * Create a metadata-only record (e.g. for emergency resolution)
+ * Create a metadata-only record (e.g. for emergency resolution).
+ * Zero local disk writes in production.
  */
 async function createMetadata(trackingId, data) {
-  ensureDir();
+  const isProd = process.env.NODE_ENV === 'production';
+  const s3Bucket = process.env.S3_EVIDENCE_BUCKET;
+  const s3Client = getS3Client();
 
   const timestamp = Date.now();
   const fileName = `metadata_${trackingId}_${timestamp}.json`;
-  const filePath = path.join(EVIDENCE_DIR, fileName);
-
   const record = {
     ...data,
     type: 'emergency_metadata',
     createdAt: new Date().toISOString()
   };
-
   const content = JSON.stringify(record, null, 2);
-  fs.writeFileSync(filePath, content);
 
-  if (process.env.S3_EVIDENCE_BUCKET) {
-    await uploadToS3(`evidence/${trackingId}/${fileName}`, content, 'application/json');
+  if (s3Client && s3Bucket) {
+    const s3Key = `evidence/${trackingId}/${fileName}`;
+    await uploadToS3(s3Key, content, 'application/json');
+    return `s3://${s3Bucket}/${s3Key}`;
   }
+
+  if (isProd) {
+    throw new Error('S3_EVIDENCE_BUCKET is required in production for emergency metadata.');
+  }
+
+  // Local-only dev fallback
+  ensureDir();
+  const filePath = path.join(EVIDENCE_DIR, fileName);
+  fs.writeFileSync(filePath, content);
   return filePath;
 }
 
 /**
  * List all evidence for a tracking ID.
- * Reads from PostgreSQL metadata when available.
+ * Strictly enforces PER-RECORD authorization:
+ * - Each owned record is only visible to its verified owner.
+ * - Each anonymous record is only visible to the bearer of its tracking secret.
+ * - Cross-user evidence leakage through shared tracking IDs is strictly impossible.
  */
-async function listEvidence(trackingId, requestingUserId = null) {
+async function listEvidence(trackingId, requestingUserId = null, trackingSecret = null) {
   const db = getDb();
   if (db && db.isDatabaseConfigured()) {
-    const where = { trackingId };
-    if (requestingUserId) {
-      where.OR = [
-        { userId: requestingUserId },
-        { userId: null }
-      ];
-    }
-    return await db.prisma.evidenceObject.findMany({
-      where,
+    const records = await db.prisma.evidenceObject.findMany({
+      where: { trackingId },
       orderBy: { createdAt: 'desc' }
     });
+
+    if (records.length === 0) return [];
+
+    // CRITICAL SECURITY FIX: Filter and authorize every record individually
+    const authorizedRecords = records.filter(record => {
+      if (record.userId) {
+        return requestingUserId && record.userId === requestingUserId;
+      } else {
+        const expectedHash = record.metadata?.trackingSecretHash;
+        if (!expectedHash) return false;
+        if (!trackingSecret) return false;
+        const providedHash = crypto.createHash('sha256').update(trackingSecret).digest('hex');
+        return safeCompare(providedHash, expectedHash);
+      }
+    });
+
+    if (authorizedRecords.length === 0) {
+      const err = new Error('Forbidden: You do not have permission to view evidence for this incident.');
+      err.statusCode = 403;
+      throw err;
+    }
+
+    return authorizedRecords;
   }
 
   if (process.env.NODE_ENV === 'production') {
@@ -295,7 +316,7 @@ async function listEvidence(trackingId, requestingUserId = null) {
  * Queries PostgreSQL metadata first to verify existence and ownership.
  * Defaults to 15 minutes (900 seconds) expiration.
  */
-async function getEvidenceDownloadUrl(trackingId, fileName, requestingUserId = null, expiresIn = 900) {
+async function getEvidenceDownloadUrl(trackingId, fileName, requestingUserId = null, trackingSecret = null, expiresIn = 900) {
   const s3Bucket = process.env.S3_EVIDENCE_BUCKET;
   const s3Client = getS3Client();
   if (!s3Client || !s3Bucket) {
@@ -310,11 +331,28 @@ async function getEvidenceDownloadUrl(trackingId, fileName, requestingUserId = n
     if (!record) {
       return null;
     }
-    // Authorization check
-    if (record.userId && requestingUserId && record.userId !== requestingUserId) {
-      const err = new Error('Forbidden: You do not have permission to access this evidence.');
-      err.statusCode = 403;
-      throw err;
+
+    // Strict Authorization Check:
+    if (record.userId) {
+      if (!requestingUserId || record.userId !== requestingUserId) {
+        const err = new Error('Forbidden: You do not have permission to access this evidence.');
+        err.statusCode = 403;
+        throw err;
+      }
+    } else {
+      const expectedHash = record.metadata?.trackingSecretHash;
+      if (expectedHash) {
+        const providedHash = trackingSecret ? crypto.createHash('sha256').update(trackingSecret).digest('hex') : null;
+        if (!providedHash || !safeCompare(providedHash, expectedHash)) {
+          const err = new Error('Forbidden: Valid emergency tracking secret is required to access anonymous evidence.');
+          err.statusCode = 403;
+          throw err;
+        }
+      } else {
+        const err = new Error('Forbidden: Anonymous evidence missing tracking capability.');
+        err.statusCode = 403;
+        throw err;
+      }
     }
   }
 
@@ -363,7 +401,7 @@ async function verifyIntegrity(trackingId, fileName) {
       const expectedHash = dbRecord ? dbRecord.sha256 : null;
 
       return {
-        valid: expectedHash ? computedHash === expectedHash : true,
+        valid: expectedHash ? safeCompare(computedHash, expectedHash) : true,
         source: 's3',
         computedHash,
         expectedHash,
@@ -387,7 +425,7 @@ async function verifyIntegrity(trackingId, fileName) {
   const expectedHash = dbRecord ? dbRecord.sha256 : (metadata ? metadata.sha256 : null);
 
   return {
-    valid: expectedHash ? computedHash === expectedHash : true,
+    valid: expectedHash ? safeCompare(computedHash, expectedHash) : true,
     expectedHash,
     computedHash,
     fileName,
@@ -401,6 +439,7 @@ module.exports = {
   listEvidence,
   getEvidenceDownloadUrl,
   verifyIntegrity,
+  safeCompare,
   EVIDENCE_DIR,
   MAX_RECORDING_MS
 };
