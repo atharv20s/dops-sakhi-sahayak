@@ -11,7 +11,7 @@ resource "aws_db_subnet_group" "sakhi_postgres" {
 
   name        = "sakhi-${var.environment}-postgres-subnets"
   description = "Default VPC subnets across ap-south-1 Availability Zones for Sakhi PostgreSQL RDS"
-  subnet_ids = [
+  subnet_ids  = [
     aws_default_subnet.subnet_a.id,
     aws_default_subnet.subnet_b.id,
     aws_default_subnet.subnet_c.id
@@ -70,9 +70,9 @@ resource "aws_db_instance" "sakhi_postgres" {
   # No plaintext database password is supplied through Terraform variables.
   manage_master_user_password = true
 
-  allocated_storage     = var.rds_allocated_storage_gib
-  storage_type          = "gp3"
-  storage_encrypted     = true
+  allocated_storage          = var.rds_allocated_storage_gib
+  storage_type               = "gp3"
+  storage_encrypted          = true
   auto_minor_version_upgrade = true
 
   port                   = 5432
@@ -84,10 +84,10 @@ resource "aws_db_instance" "sakhi_postgres" {
   publicly_accessible = true
   multi_az             = false
 
-  backup_retention_period = var.rds_backup_retention_days
-  copy_tags_to_snapshot   = true
-  deletion_protection     = true
-  skip_final_snapshot     = false
+  backup_retention_period   = var.rds_backup_retention_days
+  copy_tags_to_snapshot     = true
+  deletion_protection       = true
+  skip_final_snapshot       = false
   final_snapshot_identifier = "sakhi-${var.environment}-postgres-final"
 
   apply_immediately = false
