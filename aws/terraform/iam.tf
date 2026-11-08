@@ -18,8 +18,13 @@ resource "aws_iam_role" "github_actions_role" {
         Action = "sts:AssumeRoleWithWebIdentity"
         Condition = {
           StringEquals = {
-            "token.actions.githubusercontent.com:sub" = "repo:atharv20s@224711574/dops-sakhi-sahayak@1448475494:ref:refs/heads/main"
             "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
+            "token.actions.githubusercontent.com:sub" = [
+              "repo:atharv20s/dops-sakhi-sahayak:ref:refs/heads/main",
+              "repo:atharv20s/dops-sakhi-sahayak:environment:production",
+              "repo:atharv20s@224711574/dops-sakhi-sahayak@1448475494:ref:refs/heads/main",
+              "repo:atharv20s@224711574/dops-sakhi-sahayak@1448475494:environment:production"
+            ]
           }
         }
       }
