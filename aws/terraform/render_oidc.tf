@@ -25,14 +25,14 @@ resource "aws_iam_role" "render_workload" {
   description = "Short-lived OIDC role for the Sakhi Render backend to access evidence in S3"
 
   assume_role_policy = jsonencode({
-    Version = "2012-10-17"
+    Version   = "2012-10-17"
     Statement = [
       {
-        Effect = "Allow"
+        Effect    = "Allow"
         Principal = {
           Federated = aws_iam_openid_connect_provider.render[0].arn
         }
-        Action = "sts:AssumeRoleWithWebIdentity"
+        Action    = "sts:AssumeRoleWithWebIdentity"
         Condition = {
           StringEquals = {
             "oidc.render.com/${var.render_workspace_id}:aud" = "sts.amazonaws.com"
