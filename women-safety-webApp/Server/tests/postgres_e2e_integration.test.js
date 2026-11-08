@@ -25,15 +25,17 @@ test('PostgreSQL End-to-End Integration, Security & Persistence Suite', async (t
 
   const { prisma, checkDatabaseHealth } = require('../db');
   const { app, server, io } = require('../index');
-  const { saveEvidence, listEvidence } = require('../evidenceRecorder');
+  const { saveEvidence, listEvidence, createMetadata, EVIDENCE_DIR } = require('../evidenceRecorder');
   const {
     getJwtSecret,
     generateToken,
     verifyToken,
     revokeToken,
     isTokenRevoked,
-    constantTimeEquals
+    constantTimeEquals,
+    clearInMemoryRevocationCache
   } = require('../auth');
+  const ioClient = require('socket.io-client');
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -88,13 +90,52 @@ test('PostgreSQL End-to-End Integration, Security & Persistence Suite', async (t
     assert.ok(decoded);
     assert.equal(decoded.phone, '9999999999');
 
-    // C. Token revocation persists and invalidates session
+    // C. Token revocation persists in DB and survives in-memory cache clearing
     assert.equal(await isTokenRevoked(testToken), false);
     await revokeToken(testToken);
     assert.equal(await isTokenRevoked(testToken), true);
+
+    // Clear in-memory cache to prove it queries PostgreSQL directly
+    clearInMemoryRevocationCache();
+    assert.equal(await isTokenRevoked(testToken), true, 'Must query PostgreSQL revoked_tokens table when cache cleared');
+
+    // Verify record in PostgreSQL directly via Prisma
+    const tokenHash = crypto.createHash('sha256').update(testToken).digest('hex');
+    const dbRevoked = await prisma.revokedToken.findUnique({ where: { tokenHash } });
+    assert.ok(dbRevoked, 'Revoked token row must exist in PostgreSQL');
+    assert.equal(dbRevoked.tokenHash, tokenHash);
     assert.equal(verifyToken(testToken), null, 'Revoked token must fail verification');
 
-    // D. In production, missing or short JWT_SECRET throws
+    // D. Fail-closed on database revocation query error
+    const originalFindUnique = prisma.revokedToken.findUnique;
+    try {
+      prisma.revokedToken.findUnique = async () => { throw new Error('Simulated DB network failure'); };
+      clearInMemoryRevocationCache();
+      await assert.rejects(
+        async () => { await isTokenRevoked(testToken); },
+        (err) => {
+          assert.equal(err.statusCode, 503);
+          assert.match(err.message, /Database unavailable/);
+          return true;
+        }
+      );
+    } finally {
+      prisma.revokedToken.findUnique = originalFindUnique;
+    }
+
+    // E. JWT Key Rotation via JWT_SECRET_PREVIOUS
+    const prevSecret = 'previous-valid-key-with-at-least-32-chars-length!';
+    process.env.JWT_SECRET_PREVIOUS = prevSecret;
+    try {
+      const prevSignedToken = generateToken(mockUser, 7, prevSecret);
+      const verifiedPrev = verifyToken(prevSignedToken);
+      assert.ok(verifiedPrev, 'Token signed with previous key must be valid during rotation');
+      assert.equal(verifiedPrev.phone, '9999999999');
+    } finally {
+      delete process.env.JWT_SECRET_PREVIOUS;
+    }
+
+    // F. In production, missing or short JWT_SECRET throws
     const originalEnv = process.env.NODE_ENV;
     const originalSecret = process.env.JWT_SECRET;
     try {
@@ -304,7 +345,168 @@ test('PostgreSQL End-to-End Integration, Security & Persistence Suite', async (t
     assert.ok(dbReport, 'Report must be in PostgreSQL safety_reports table');
   });
 
-  // ── Test 9: Data Persists across Connection Teardown and Reconnect ──
+  // ── Test 9: Logout Fail-Closed & Session Revocation Verification ──
+  await t.test('POST /api/logout revokes session and fails closed if database write fails', async () => {
+    // 1. Successful logout
+    const logoutToken = generateToken({ id: registeredUserId, phone: testPhone, name: 'Priya Deshmukh' });
+    const logoutRes = await fetch(`${baseUrl}/api/logout`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${logoutToken}` }
+    });
+    assert.equal(logoutRes.status, 200);
+    const logoutData = await logoutRes.json();
+    assert.equal(logoutData.success, true);
+    assert.equal(await isTokenRevoked(logoutToken), true);
+
+    // 2. Database write failure triggers HTTP 503 fail-closed response
+    const originalUpsert = prisma.revokedToken.upsert;
+    try {
+      prisma.revokedToken.upsert = async () => { throw new Error('Simulated DB outage during logout'); };
+      const failToken = generateToken({ id: registeredUserId, phone: testPhone, name: 'Priya Deshmukh' });
+      const failLogoutRes = await fetch(`${baseUrl}/api/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${failToken}` }
+      });
+      assert.equal(failLogoutRes.status, 503, 'Logout must fail closed with 503 when DB cannot persist revocation');
+      const failData = await failLogoutRes.json();
+      assert.equal(failData.success, false);
+      assert.match(failData.error, /Failed to persist session revocation/);
+    } finally {
+      prisma.revokedToken.upsert = originalUpsert;
+    }
+  });
+
+  // ── Test 10: Socket.IO Handshake Authentication & Fail-Closed Revocation ──
+  await t.test('Socket.IO handshake authentication validates tokens and rejects revoked sessions', async () => {
+    // 1. Anonymous connection succeeds (emergency SOS requirement)
+    const anonSocket = ioClient(baseUrl, {
+      transports: ['websocket'],
+      forceNew: true
+    });
+    await new Promise((resolve, reject) => {
+      anonSocket.on('connect', resolve);
+      anonSocket.on('connect_error', reject);
+    });
+    assert.ok(anonSocket.connected);
+    anonSocket.disconnect();
+
+    // 2. Valid token connection succeeds
+    const validSocketToken = generateToken({ id: 'usr-socket-ok', phone: '9123456789', name: 'Socket User' });
+    const validSocket = ioClient(baseUrl, {
+      auth: { token: validSocketToken },
+      transports: ['websocket'],
+      forceNew: true
+    });
+    await new Promise((resolve, reject) => {
+      validSocket.on('connect', resolve);
+      validSocket.on('connect_error', reject);
+    });
+    assert.ok(validSocket.connected);
+    validSocket.disconnect();
+
+    // 3. Revoked token is rejected during handshake
+    const toRevokeToken = generateToken({ id: 'usr-socket-revoked', phone: '9988112233', name: 'Revoked User' });
+    await revokeToken(toRevokeToken);
+
+    const revokedSocket = ioClient(baseUrl, {
+      auth: { token: toRevokeToken },
+      transports: ['websocket'],
+      forceNew: true
+    });
+    const err = await new Promise((resolve) => {
+      revokedSocket.on('connect', () => resolve(null));
+      revokedSocket.on('connect_error', (e) => resolve(e));
+    });
+    assert.ok(err, 'Revoked token handshake must fail');
+    assert.match(err.message, /Token has been revoked/);
+    revokedSocket.disconnect();
+
+    // 4. Invalid token is rejected
+    const badSocket = ioClient(baseUrl, {
+      auth: { token: 'invalid.corrupted.jwt' },
+      transports: ['websocket'],
+      forceNew: true
+    });
+    const badErr = await new Promise((resolve) => {
+      badSocket.on('connect', () => resolve(null));
+      badSocket.on('connect_error', (e) => resolve(e));
+    });
+    assert.ok(badErr, 'Corrupt token handshake must fail');
+    assert.match(badErr.message, /Invalid or expired token/);
+    badSocket.disconnect();
+  });
+
+  // ── Test 11: Per-record authorization in listEvidence prevents cross-tenant leakage ──
+  await t.test('listEvidence enforces strict per-record authorization on shared trackingId', async () => {
+    const sharedTrackingId = `trk_shared_${Date.now()}`;
+    const userA = registeredUserId;
+    const userBRecord = await prisma.user.create({
+      data: {
+        name: 'Tenant Bravo',
+        phone: `9876${Date.now().toString().slice(-6)}`,
+        passwordHash: '$2a$10$abcdefghijklmnopqrstuv'
+      }
+    });
+    const userB = userBRecord.id;
+    const unrelatedUserId = crypto.randomUUID();
+
+    // User A saves evidence under sharedTrackingId
+    const resA = await saveEvidence(sharedTrackingId, Buffer.from('AUDIO_USER_A'), 'webm', userA);
+    assert.ok(resA.evidenceId);
+
+    // User B saves evidence under same sharedTrackingId
+    const resB = await saveEvidence(sharedTrackingId, Buffer.from('AUDIO_USER_B'), 'webm', userB);
+    assert.ok(resB.evidenceId);
+
+    // When User A queries evidence for sharedTrackingId, they MUST ONLY see their own record
+    const listA = await listEvidence(sharedTrackingId, userA);
+    assert.equal(listA.length, 1);
+    assert.equal(listA[0].id, resA.evidenceId);
+    assert.equal(listA[0].userId, userA);
+
+    // When User B queries evidence for sharedTrackingId, they MUST ONLY see their own record
+    const listB = await listEvidence(sharedTrackingId, userB);
+    assert.equal(listB.length, 1);
+    assert.equal(listB[0].id, resB.evidenceId);
+    assert.equal(listB[0].userId, userB);
+
+    // When an unauthenticated user or unrelated user queries without authorization, it throws 403
+    await assert.rejects(
+      async () => { await listEvidence(sharedTrackingId, unrelatedUserId); },
+      (err) => {
+        assert.equal(err.statusCode, 403);
+        assert.match(err.message, /Forbidden/);
+        return true;
+      }
+    );
+  });
+
+  // ── Test 12: Zero local disk writes and fail-closed storage in production ──
+  await t.test('Zero local disk writes enforced in production environment', async () => {
+    const origEnv = process.env.NODE_ENV;
+    const origBucket = process.env.S3_EVIDENCE_BUCKET;
+    try {
+      process.env.NODE_ENV = 'production';
+      delete process.env.S3_EVIDENCE_BUCKET;
+
+      // 1. saveEvidence without S3 in production MUST fail-closed without writing to disk
+      await assert.rejects(
+        async () => { await saveEvidence('trk_prod_test', Buffer.from('TEST'), 'webm'); },
+        /S3_EVIDENCE_BUCKET is required in production/
+      );
+
+      // 2. createMetadata without S3 in production MUST fail-closed without writing to disk
+      await assert.rejects(
+        async () => { await createMetadata('trk_prod_test', { status: 'test' }); },
+        /S3_EVIDENCE_BUCKET is required in production/
+      );
+    } finally {
+      process.env.NODE_ENV = origEnv;
+      process.env.S3_EVIDENCE_BUCKET = origBucket;
+    }
+  });
+
+  // ── Test 13: Data Persists across Connection Teardown and Reconnect ──
   await t.test('PostgreSQL database records persist durably across disconnect and reconnect', async () => {
     await prisma.$disconnect();
 

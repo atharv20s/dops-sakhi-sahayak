@@ -18,6 +18,7 @@ const {
   generateToken,
   verifyToken,
   revokeToken,
+  isTokenRevoked,
   requireAuth,
   optionalAuth,
   createRateLimiter,
@@ -47,15 +48,36 @@ const io = new Server(server, {
 });
 
 // Socket.IO authentication middleware: populates verified user session from handshake
-io.use((socket, next) => {
+// FAILS CLOSED: Asynchronously verifies token validity and database revocation.
+// Preserves anonymous access for emergency SOS when no token is provided.
+io.use(async (socket, next) => {
   const token = socket.handshake?.auth?.token;
-  if (token) {
-    const user = verifyToken(token);
-    if (user) {
-      socket.user = user;
-    }
+  if (!token) {
+    // Preserve anonymous emergency connections
+    return next();
   }
-  next();
+
+  // Verify structure, signature, and expiration
+  const user = verifyToken(token, { ignoreRevocation: true });
+  if (!user) {
+    return next(new Error('Authentication failed: Invalid or expired token'));
+  }
+
+  try {
+    const revoked = await isTokenRevoked(token);
+    if (revoked) {
+      return next(new Error('Authentication failed: Token has been revoked'));
+    }
+    socket.user = user;
+    return next();
+  } catch (err) {
+    console.error('❌ [Socket.IO Auth] Handshake revocation check failed:', err.message);
+    if (process.env.NODE_ENV === 'production' || isDatabaseConfigured()) {
+      return next(new Error('Authentication service unavailable'));
+    }
+    socket.user = user;
+    return next();
+  }
 });
 
 // Setup Redis Adapter for multi-server WebSocket scaling if REDIS_URL is provided
@@ -381,6 +403,7 @@ router.post('/login', authLimiter, async (req, res) => {
 });
 
 // ── Auth: Logout / Session Revocation (persists revoked token hash) ──
+// FAILS CLOSED: Returns 503 if database cannot persist the revocation
 router.post('/logout', requireAuth, async (req, res) => {
   try {
     if (req.token) {
@@ -388,7 +411,8 @@ router.post('/logout', requireAuth, async (req, res) => {
     }
     res.json({ success: true, msg: 'Session successfully revoked. Logged out.' });
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error('❌ [Auth] Logout error:', err.message);
+    res.status(err.statusCode || 503).json({ success: false, error: err.message });
   }
 });
 
