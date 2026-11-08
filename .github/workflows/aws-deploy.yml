@@ -7,9 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# PR checks are isolated by ref; main-branch deploys serialize under sakhi-render-production.
+# PR checks cancel superseded runs on the same branch; main-branch CI runs uniquely by SHA.
+# Production Render deployment is serialized strictly at the job level.
 concurrency:
-  group: ${{ github.ref_name == 'main' && 'sakhi-render-production' || github.ref }}
+  group: ${{ github.ref_name == 'main' && github.sha || github.ref }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 env:
@@ -166,6 +167,9 @@ jobs:
     name: Deploy Exact ECR Digest to Render
     runs-on: ubuntu-latest
     needs: publish-ecr
+    concurrency:
+      group: sakhi-render-production
+      cancel-in-progress: false
     if: >-
       github.event_name != 'pull_request' &&
       github.ref == 'refs/heads/main' &&
