@@ -10,10 +10,10 @@ COPY package*.json ./
 COPY prisma ./prisma/
 
 # Install all dependencies (including prisma CLI devDependency)
-RUN npm ci
+RUN DATABASE_URL="postgresql://build:build@127.0.0.1:5432/build" DIRECT_URL="postgresql://build:build@127.0.0.1:5432/build" npm ci
 
 # Generate Prisma Client (outputs to node_modules/@prisma/client and .prisma)
-RUN npx prisma generate
+RUN DATABASE_URL="postgresql://build:build@127.0.0.1:5432/build" DIRECT_URL="postgresql://build:build@127.0.0.1:5432/build" npx prisma generate
 
 # Prune dev dependencies keeping the generated prisma client
 RUN npm prune --omit=dev \
