@@ -119,15 +119,19 @@ Supply the ID of the previous known-good Render deploy. The workflow calls Rende
 
 Keep the prior image digest available in ECR. Deleting its image would prevent a digest-based redeploy or rollback.
 
-## Production data and storage caveats — resolve before relying on this service
+## Production database, migrations, and storage requirements
 
-The backend currently calls Mongoose with `MONGO_URI`. When that variable is absent or the database cannot be reached, the code falls back to in-memory demo data. In-memory users are not durable across process restarts or redeployments.
+The backend now uses Prisma with PostgreSQL. Configure both `DATABASE_URL` and `DIRECT_URL` on Render:
+- `DATABASE_URL` is the least-privilege runtime user used by the application.
+- `DIRECT_URL` is the migration user used by `prisma migrate deploy`.
 
-The evidence recorder uses local disk when S3 is not configured. Render's container filesystem is ephemeral unless a persistent disk is configured. Evidence written only to local disk can be lost during redeploys/restarts.
+The Docker image contains the pinned Prisma CLI and applies checked-in forward-only migrations before starting Node. If migrations fail, the container does not start. The `/health` route checks process liveness; `/ready` checks PostgreSQL connectivity. The production deployment workflow verifies both endpoints.
 
-The current S3 client uses the AWS SDK default credential chain. An ECS task role does not automatically become available to a Render service. Do not set `S3_EVIDENCE_BUCKET` on Render until a secure workload-identity or other approved credential design is configured. Do not copy long-lived AWS access keys into source code.
+The evidence recorder requires PostgreSQL metadata and S3 object storage in production. Render's container filesystem is ephemeral and is not a durable evidence store.
 
-Therefore, a successful `/health` check verifies that the HTTP process is alive; it does not prove database persistence, S3 evidence durability, emergency-notification provider credentials, or complete application readiness.
+For S3 access, the Render backend must assume the narrowly scoped `RenderSakhiWorkloadRole` using Render-managed AWS OIDC. This requires a Pro workspace or higher. Set `AWS_ROLE_ARN` on the Render service; Render automatically supplies `AWS_WEB_IDENTITY_TOKEN_FILE`. Do not set static AWS access keys or manually set the token-file variable.
+
+Render OIDC does not authorize private ECR image pulls. Keep the separate short-lived ECR registry credential and refresh workflow for the image-backed service.
 
 ## AWS budget guardrails
 
