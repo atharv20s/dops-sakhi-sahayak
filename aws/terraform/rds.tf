@@ -10,7 +10,7 @@ resource "aws_db_subnet_group" "sakhi_postgres" {
   count = var.enable_rds ? 1 : 0
 
   name        = "sakhi-${var.environment}-postgres-subnets"
-  description = "Private AWS subnet inventory used by Sakhi PostgreSQL RDS"
+  description = "Default VPC subnets across ap-south-1 Availability Zones for Sakhi PostgreSQL RDS"
   subnet_ids = [
     aws_default_subnet.subnet_a.id,
     aws_default_subnet.subnet_b.id,
