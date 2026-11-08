@@ -16,7 +16,9 @@ RUN npm ci
 RUN npx prisma generate
 
 # Prune dev dependencies keeping the generated prisma client
-RUN npm prune --omit=dev
+RUN npm prune --omit=dev \
+    && npm install --no-save --omit=dev prisma@6.4.1 \
+    && ./node_modules/.bin/prisma --version
 
 # Stage 2: Production Runner
 FROM node:24-alpine AS runner
@@ -36,4 +38,5 @@ EXPOSE 5001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:5001/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
 
-# Apply checked-in, forward-only migrations before serving production traffic.\nCMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && exec node index.js"]
+# Apply checked-in, forward-only migrations before serving production traffic.
+CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && exec node index.js"]
