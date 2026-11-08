@@ -736,7 +736,7 @@ function startRecording(socketId, io) {
     const currentState = getState(socketId);
     if (currentState.status === STATES.RECORDING) {
       console.log(`[VoiceAgent] 8-minute recording limit reached for ${socketId}`);
-      resolveEmergency(socketId, io, 'Recording time limit reached (8 min)');
+      resolveEmergency(socketId, io, 'Recording time limit reached (8 min)').catch(err => console.error('[VoiceAgent] Emergency resolution failed:', err.message));
     }
   }, 8 * 60 * 1000);
 
@@ -747,7 +747,7 @@ function startRecording(socketId, io) {
  * LangGraph Edge: RECORDING → RESOLVED
  * Condition: 8min elapsed OR "Safety Confirmed"
  */
-function resolveEmergency(socketId, io, reason = 'Safety confirmed by user') {
+async function resolveEmergency(socketId, io, reason = 'Safety confirmed by user') {
   const state = getState(socketId);
 
   // Clear timers
@@ -771,9 +771,23 @@ function resolveEmergency(socketId, io, reason = 'Safety confirmed by user') {
     stateHistory: state.stateHistory
   };
 
-  createMetadata(state.trackingId, metadata);
+  // Wait for durable metadata persistence before announcing resolution.
+  // A storage failure must be visible, but must not prevent the safety state
+  // from transitioning or the client from receiving the resolution event.
+  let metadataPersisted = false;
+  try {
+    await createMetadata(state.trackingId, metadata);
+    metadataPersisted = true;
+  } catch (err) {
+    console.error(`[VoiceAgent] ❌ Emergency metadata persistence failed for ${state.trackingId}:`, err.message);
+    io.to(socketId).emit('evidence-error', {
+      success: false,
+      trackingId: state.trackingId,
+      error: 'Emergency metadata could not be saved to secure storage.'
+    });
+  }
 
-  setState(socketId, { status: STATES.RESOLVED });
+  setState(socketId, { status: STATES.RESOLVED, metadataPersisted });
 
   // Notify client
   io.to(socketId).emit('agent-state-update', {
