@@ -69,6 +69,7 @@ jobs:
         working-directory: women-safety-webApp/Server
         env:
           DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/sakhi_test?schema=public
+          DIRECT_URL: postgresql://postgres:postgrespassword@localhost:5432/sakhi_test?schema=public
           JWT_SECRET: c0ffee-test-session-secret-at-least-32-chars-long!
           NODE_ENV: test
         run: |
@@ -306,4 +307,20 @@ jobs:
             sleep 10
           done
           echo "Render deployment is live but the application health endpoint failed."
+          exit 1
+
+      - name: Verify PostgreSQL Readiness Endpoint
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if BODY="$(curl --fail --silent --show-error "$RENDER_SERVICE_URL/ready")" && \
+               echo "$BODY" | jq -e '.status == "ready" and .database == "connected"' >/dev/null; then
+              echo "Render backend and PostgreSQL readiness check passed."
+              echo "$BODY" | jq .
+              exit 0
+            fi
+            echo "Database readiness not available yet (check $attempt/20)."
+            sleep 10
+          done
+          echo "Render deployment is live but PostgreSQL readiness failed."
           exit 1
