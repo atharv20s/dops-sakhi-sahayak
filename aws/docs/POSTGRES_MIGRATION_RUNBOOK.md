@@ -29,7 +29,7 @@ Render's native AWS Workload Identity (OIDC) eliminates the need for static AWS 
       "Condition": {
         "StringEquals": {
           "oidc.render.com/<WORKSPACE_ID>:aud": "sts.amazonaws.com",
-          "oidc.render.com/<WORKSPACE_ID>:sub": "service:<RENDER_SERVICE_ID>"
+          "oidc.render.com/<WORKSPACE_ID>:sub": "workspace:<WORKSPACE_ID>:environment:<ENVIRONMENT_ID>:service:<RENDER_SERVICE_ID>"
         }
       }
     }
@@ -74,7 +74,7 @@ When Workload Identity is enabled, Render automatically injects `AWS_WEB_IDENTIT
 - **No `0.0.0.0/0` Ingress**: Port 5432 is restricted to verified outbound IPs.
 - **Shared vs Dedicated IP Trade-off**:
   - *Option A (Default Shared CIDRs)*: Free on Render Starter, but uses Render Singapore's shared outbound IP range. These ranges are shared among other Render customers in Singapore.
-  - *Option B (Dedicated Outbound IP)*: Requires a Render **Pro workspace ($19/mo)** + **Dedicated IP add-on ($10/mo)**. Provides dedicated, exclusive static egress IPs for a zero-trust allowlist.
+  - *Option B (Dedicated Outbound IP)*: Requires a Render **Pro workspace ($25/mo flat)** + **Dedicated IP set ($100/mo per set)**. Provides dedicated, exclusive static egress IPs for a zero-trust allowlist.
 
 ---
 
@@ -117,21 +117,22 @@ When Workload Identity is enabled, Render automatically injects `AWS_WEB_IDENTIT
 
 | Service | Tier / Plan | Monthly Cost (USD) | Notes |
 | :--- | :--- | :--- | :--- |
-| **AWS RDS PostgreSQL** | `db.t4g.micro` (Single-AZ, ap-south-1) | ~$14.60 | Accounts after July 15, 2025 have credit/promotional tiers (up to 6 months), not 12-month legacy Free Tier |
-| **AWS RDS Storage** | 20 GB gp3 | ~$2.30 | $0.115/GB-month in Mumbai |
-| **AWS Automated Backups** | 7-day retention (20 GB snapshot storage) | ~$1.90 | First 20 GB included free; incremental snapshots |
-| **AWS S3 Storage** | Evidence audio recordings (< 10 GB) | < $0.25 | $0.023/GB-month |
-| **Amazon ECR** | Container image digests | < $0.50 | $0.10/GB-month |
-| **Render Web Service** | Starter Instance (Always-on, 512 MB) | **$7.00** | Zero sleep; immediate SOS latency |
-| **Render Pro Workspace** *(Optional)* | Required for OIDC / Dedicated IP | **$19.00** | Workspace base fee |
-| **Render Dedicated Outbound IP** *(Optional)* | Static IP address set | **$10.00** | Excludes other tenants from DB allowlist |
-| **Vercel** | Hobby Tier (Frontend) | **$0.00** | Unlimited static hosting for individual projects |
+| **AWS RDS PostgreSQL** | `db.t4g.micro` (Single-AZ, ap-south-1) | ~$15.33 | Indicative on-demand compute estimate; verify in AWS Pricing Calculator |
+| **AWS RDS Storage** | 20 GiB gp3 | ~$2.62 | Indicative Mumbai estimate |
+| **RDS public IPv4** | Publicly reachable RDS endpoint | ~$3.65 | Approx. $0.005/hour while allocated |
+| **Secrets Manager** | RDS-managed master secret | ~$0.40 | Per secret/month, plus API calls |
+| **AWS backups / transfer / logs** | Usage dependent | Variable | May add charges beyond this baseline |
+| **Amazon S3 / ECR** | Existing objects and images | Usage dependent | Retention and transfer affect cost |
+| **Render Web Service** | Starter instance | ~$7.00 | Compute charge, separate from workspace plan |
+| **Render Pro Workspace** | Required for managed AWS OIDC | $25.00 | Flat monthly workspace fee |
+| **Render Dedicated IP set** | Optional, three IPv4 addresses | $100.00 | Per set/month; not included in baseline |
+| **Vercel** | Hobby frontend | $0.00 | Subject to plan eligibility and usage limits |
 
 ### Cost Summaries:
-- **Pragmatic Production (Shared Render CIDRs + Render Starter + RDS)**:
-  **~$26.50 / month** (or ~$7.00/month if utilizing AWS credits).
-- **Enterprise Isolation (Render Pro + Dedicated IP + Render Starter + RDS)**:
-  **~$55.50 / month**.
+- **Hybrid baseline (Render Pro + Starter + RDS)**: approximately **$54+/month**, before usage-dependent charges and taxes.
+- **With one Render dedicated outbound IP set**: approximately **$154+/month**.
+- The previous <$2/month AWS budget is incompatible with always-on RDS. AWS credits may temporarily offset AWS charges only; they do not cover Render fees.
+- Keep `enable_rds` and `enable_render_oidc` false until the owner approves recurring costs and verifies all network/identity inputs.
 
 ---
 
