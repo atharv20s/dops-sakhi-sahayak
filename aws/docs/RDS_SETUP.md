@@ -128,6 +128,7 @@ sudo apt install postgresql-client
 Connect using the master secret and create two separate accounts. Generate passwords locally with `openssl rand -hex 32`; replace the placeholders locally, not in source control:
 
 ```sql
+-- Run as the RDS master user while connected to sakhi_production:
 CREATE USER sakhi_migrator WITH PASSWORD '<MIGRATION_PASSWORD>';
 CREATE USER sakhi_app WITH PASSWORD '<APP_PASSWORD>';
 
@@ -135,16 +136,19 @@ GRANT CONNECT ON DATABASE sakhi_production TO sakhi_migrator, sakhi_app;
 GRANT USAGE ON SCHEMA public TO sakhi_app;
 GRANT CREATE ON SCHEMA public TO sakhi_migrator;
 
+-- Existing objects, if any:
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sakhi_app;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO sakhi_app;
 
-ALTER DEFAULT PRIVILEGES FOR ROLE sakhi_migrator IN SCHEMA public
+-- Reconnect to sakhi_production as sakhi_migrator, then run these defaults.
+-- They make future Prisma-created tables/sequences available to sakhi_app.
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sakhi_app;
-ALTER DEFAULT PRIVILEGES FOR ROLE sakhi_migrator IN SCHEMA public
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
   GRANT USAGE, SELECT ON SEQUENCES TO sakhi_app;
 ```
 
-The runtime account cannot create or alter tables. The migration account owns objects it creates and can apply Prisma schema migrations. Keep both passwords in Render's encrypted environment settings only.
+The runtime account cannot create or alter tables. The migration account owns objects it creates and can apply Prisma schema migrations. `sakhi_migrator` must own or be allowed to alter the objects created by Prisma migrations. `sakhi_app` receives no schema `CREATE`, `ALTER`, or `DROP` permission. Keep both passwords in Render's encrypted environment settings only.
 
 ## Step 5 — Configure Render environment
 
