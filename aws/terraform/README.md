@@ -125,3 +125,17 @@ and found no differences, so no changes are needed.
 - **S3 Public Access Block**: `100% Active` (4/4 controls enabled)
 - **S3 Server-Side Encryption**: `AES256 Enforced`
 - **Total Persistent Compute Cost**: **$0.00 / month** (Comfortably inside the <$2.00/month budget)
+
+
+## Optional Production Database and Render Runtime Identity
+
+The current live audit remains limited to the 22 imported AWS resources listed above. PostgreSQL RDS and Render workload OIDC are **not live resources** and are not created by the default configuration.
+
+The optional files `rds.tf` and `render_oidc.tf` add:
+- An encrypted, single-AZ PostgreSQL RDS instance using RDS-managed Secrets Manager credentials.
+- A DB subnet group and a database security group that accepts port 5432 only from explicit Render IPv4 CIDRs.
+- A Render AWS OIDC provider and service-scoped workload role with access only to `s3://${var.evidence_bucket_name}/evidence/*`.
+
+Both features are disabled by default (`enable_rds=false`, `enable_render_oidc=false`). RDS also requires a non-empty, validated `render_outbound_cidrs` list. Render OIDC requires the actual workspace, environment, and service IDs and a Pro workspace or higher. See [RDS_SETUP.md](../docs/RDS_SETUP.md) before enabling anything.
+
+**Important state warning:** this root still uses the original local Terraform state. Keep that state on the original WSL machine, back it up before any plan, and never run an apply from a fresh clone without that state. PR CI uses `terraform init -backend=false` and validates configuration only; it does not read or modify AWS.

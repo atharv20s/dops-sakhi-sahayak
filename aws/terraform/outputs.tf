@@ -80,3 +80,35 @@ output "iam_oidc_provider_arn" {
   description = "GitHub Actions OIDC provider ARN"
   value       = aws_iam_openid_connect_provider.github.arn
 }
+
+
+# Optional resources. These remain null until their opt-in variables are enabled.
+output "rds_endpoint" {
+  description = "DNS endpoint for the optional Sakhi PostgreSQL RDS instance"
+  value       = try(aws_db_instance.sakhi_postgres[0].address, null)
+}
+
+output "rds_port" {
+  description = "Port for the optional Sakhi PostgreSQL RDS instance"
+  value       = try(aws_db_instance.sakhi_postgres[0].port, null)
+}
+
+output "rds_database_name" {
+  description = "Database name for the optional Sakhi PostgreSQL RDS instance"
+  value       = try(aws_db_instance.sakhi_postgres[0].db_name, null)
+}
+
+output "rds_master_secret_arn" {
+  description = "Secrets Manager ARN containing the RDS-managed administrative password"
+  value       = try(aws_db_instance.sakhi_postgres[0].master_user_secret[0].secret_arn, null)
+}
+
+output "iam_role_render_workload_arn" {
+  description = "Optional IAM role ARN to configure as AWS_ROLE_ARN on the Render backend"
+  value       = try(aws_iam_role.render_workload[0].arn, null)
+}
+
+output "iam_oidc_provider_render_arn" {
+  description = "Optional Render OIDC provider ARN"
+  value       = try(aws_iam_openid_connect_provider.render[0].arn, null)
+}

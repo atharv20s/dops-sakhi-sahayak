@@ -2,7 +2,7 @@ name: Sakhi Sahayak - CI, ECR and Render CD
 
 on:
   push:
-    branches: [main, feat/postgres-prisma-migration]
+    branches: [main]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -44,6 +44,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.17.1
+
+      - name: Format and Validate Terraform (No AWS Access or State)
+        working-directory: aws/terraform
+        run: |
+          terraform fmt -diff -check -recursive
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
       - name: Setup Node.js 24
         uses: actions/setup-node@v4
         with:
@@ -57,6 +69,7 @@ jobs:
         working-directory: women-safety-webApp/Server
         env:
           DATABASE_URL: postgresql://postgres:postgrespassword@localhost:5432/sakhi_test?schema=public
+          DIRECT_URL: postgresql://postgres:postgrespassword@localhost:5432/sakhi_test?schema=public
           JWT_SECRET: c0ffee-test-session-secret-at-least-32-chars-long!
           NODE_ENV: test
         run: |
@@ -294,4 +307,20 @@ jobs:
             sleep 10
           done
           echo "Render deployment is live but the application health endpoint failed."
+          exit 1
+
+      - name: Verify PostgreSQL Readiness Endpoint
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            if BODY="$(curl --fail --silent --show-error "$RENDER_SERVICE_URL/ready")" && \
+               echo "$BODY" | jq -e '.status == "ready" and .database == "connected"' >/dev/null; then
+              echo "Render backend and PostgreSQL readiness check passed."
+              echo "$BODY" | jq .
+              exit 0
+            fi
+            echo "Database readiness not available yet (check $attempt/20)."
+            sleep 10
+          done
+          echo "Render deployment is live but PostgreSQL readiness failed."
           exit 1
