@@ -88,17 +88,28 @@ When Workload Identity is enabled, Render automatically injects `AWS_WEB_IDENTIT
   ```
   AWS RDS automatically creates, manages, and rotates the master administrative secret in AWS Secrets Manager.
 
-### 3.2 Application Database User
-- A dedicated application user (`sakhi_app`) is created for daily CRUD operations:
+### 3.2 Separate Migration and Runtime Database Users
+- A dedicated migration user (`sakhi_migrator`) applies checked-in Prisma migrations. A separate runtime user (`sakhi_app`) performs application CRUD only.
   ```sql
+  -- Run as the RDS master user while connected to sakhi_production:
+  CREATE USER sakhi_migrator WITH PASSWORD '<MIGRATION_PASSWORD>';
   CREATE USER sakhi_app WITH PASSWORD '<APP_PASSWORD>';
-  GRANT CONNECT ON DATABASE sakhi_production TO sakhi_app;
+
+  GRANT CONNECT ON DATABASE sakhi_production TO sakhi_migrator, sakhi_app;
   GRANT USAGE ON SCHEMA public TO sakhi_app;
+  GRANT CREATE ON SCHEMA public TO sakhi_migrator;
+
   GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO sakhi_app;
   GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO sakhi_app;
   ```
-  `sakhi_app` lacks `DROP TABLE`, `ALTER TABLE`, or superuser privileges.
-
+- Reconnect as `sakhi_migrator` and set default privileges for objects created by Prisma migrations:
+  ```sql
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO sakhi_app;
+  ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT USAGE, SELECT ON SEQUENCES TO sakhi_app;
+  ```
+- Configure `DATABASE_URL` with `sakhi_app` and `DIRECT_URL` with `sakhi_migrator`. The runtime user has no schema DDL privileges; the migration user is used only by the deploy-time migration command.
 ---
 
 ## 4. Prisma Migration & Rollback Strategy
